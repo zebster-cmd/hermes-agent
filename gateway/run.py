@@ -573,7 +573,6 @@ class GatewayRunner:
     def _flush_memories_for_session(
         self,
         old_session_id: str,
-        honcho_session_key: Optional[str] = None,
     ):
         """Prompt the agent to save memories/skills before context is lost.
 
@@ -608,7 +607,6 @@ class GatewayRunner:
                 quiet_mode=True,
                 enabled_toolsets=["memory", "skills"],
                 session_id=old_session_id,
-                honcho_session_key=honcho_session_key,
             )
             # Fully silence the flush agent — quiet_mode only suppresses init
             # messages; tool call output still leaks to the terminal through
@@ -671,22 +669,14 @@ class GatewayRunner:
             tmp_agent.run_conversation(
                 user_message=flush_prompt,
                 conversation_history=msgs,
-                sync_honcho=False,
             )
             logger.info("Pre-reset memory flush completed for session %s", old_session_id)
-            # Flush any queued Honcho writes before the session is dropped
-            if getattr(tmp_agent, '_honcho', None):
-                try:
-                    tmp_agent._honcho.shutdown()
-                except Exception:
-                    pass
         except Exception as e:
             logger.debug("Pre-reset memory flush failed for session %s: %s", old_session_id, e)
 
     async def _async_flush_memories(
         self,
         old_session_id: str,
-        honcho_session_key: Optional[str] = None,
     ):
         """Run the sync memory flush in a thread pool so it won't block the event loop."""
         loop = asyncio.get_event_loop()
@@ -694,7 +684,6 @@ class GatewayRunner:
             None,
             self._flush_memories_for_session,
             old_session_id,
-            honcho_session_key,
         )
 
     @property
