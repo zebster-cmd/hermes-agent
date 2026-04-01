@@ -468,6 +468,14 @@ try:
 except Exception:
     pass
 
+# Rich-based response highlighting (syntax highlight fenced code blocks)
+try:
+    from agent.rich_output import StreamingCodeBlockHighlighter as _CodeBlockHL
+    from agent.rich_output import format_response as _format_response
+    _RICH_RESPONSE = True
+except ImportError:
+    _RICH_RESPONSE = False
+
 # Neuter AsyncHttpxClientWrapper.__del__ before any AsyncOpenAI clients are
 # created.  The SDK's __del__ schedules aclose() on asyncio.get_running_loop()
 # which, during CLI idle time, finds prompt_toolkit's event loop and tries to
@@ -1088,12 +1096,18 @@ class HermesCLI:
         # Inline diff previews for write actions (display.inline_diffs in config.yaml)
         self._inline_diffs_enabled = CLI_CONFIG["display"].get("inline_diffs", True)
 
+        # Syntax-highlighted code preview for execute_code (display.code_highlight in config.yaml)
+        self._code_highlight_enabled = CLI_CONFIG["display"].get("code_highlight", True)
+        from agent.display import set_code_highlight_active
+        set_code_highlight_active(self._code_highlight_enabled)
+
         # Streaming display state
         self._stream_buf = ""        # Partial line buffer for line-buffered rendering
         self._stream_started = False  # True once first delta arrives
         self._stream_box_opened = False  # True once the response box header is printed
         self._reasoning_stream_started = False  # True once live reasoning starts streaming
         self._reasoning_preview_buf = ""  # Coalesce tiny reasoning chunks for [thinking] output
+        self._stream_code_hl = _CodeBlockHL() if _RICH_RESPONSE else None
         self._pending_edit_snapshots = {}
         
         # Configuration - priority: CLI args > env vars > config file
@@ -1872,7 +1886,22 @@ class HermesCLI:
         _tc = getattr(self, "_stream_text_ansi", "")
         while "\n" in self._stream_buf:
             line, self._stream_buf = self._stream_buf.split("\n", 1)
-            _cprint(f"{_tc}{line}{_RST}" if _tc else line)
+            if _RICH_RESPONSE:
+                out = self._stream_code_hl.process_line(line)
+                if out is None:
+                    continue  # buffering a code block
+                if out is line:
+                    # Plain text — preserve response text colour
+                    _cprint(f"{_tc}{out}{_RST}" if _tc else out)
+                elif "\n" in out:
+                    # Multi-line highlighted block — has its own ANSI colours
+                    for hl_line in out.splitlines():
+                        _cprint(hl_line)
+                else:
+                    # Single-line highlighted block
+                    _cprint(out)
+            else:
+                _cprint(f"{_tc}{line}{_RST}" if _tc else line)
 
     def _flush_stream(self) -> None:
         """Emit any remaining partial line from the stream buffer and close the box."""
@@ -1881,7 +1910,20 @@ class HermesCLI:
 
         if self._stream_buf:
             _tc = getattr(self, "_stream_text_ansi", "")
-            _cprint(f"{_tc}{self._stream_buf}{_RST}" if _tc else self._stream_buf)
+            if _RICH_RESPONSE:
+                buf = self._stream_buf
+                out = self._stream_code_hl.process_line(buf)
+                if out is not None:
+                    if out is buf:
+                        _cprint(f"{_tc}{out}{_RST}" if _tc else out)
+                    else:
+                        _cprint(out)
+                # Flush any open code block (unclosed fence at end of response)
+                tail = self._stream_code_hl.flush()
+                if tail:
+                    _cprint(tail)
+            else:
+                _cprint(f"{_tc}{self._stream_buf}{_RST}" if _tc else self._stream_buf)
             self._stream_buf = ""
 
         # Close the response box
@@ -1901,6 +1943,8 @@ class HermesCLI:
         self._reasoning_box_opened = False
         self._reasoning_buf = ""
         self._reasoning_preview_buf = ""
+        if _RICH_RESPONSE:
+            self._stream_code_hl.reset()
 
     def _slow_command_status(self, command: str) -> str:
         """Return a user-facing status message for slower slash commands."""
@@ -3888,6 +3932,8 @@ class HermesCLI:
             self.console.print(f"  Status bar {state}")
         elif canonical == "verbose":
             self._toggle_verbose()
+        elif canonical == "code-highlight":
+            self._toggle_code_highlight()
         elif canonical == "yolo":
             self._toggle_yolo()
         elif canonical == "reasoning":
@@ -4605,6 +4651,17 @@ class HermesCLI:
         }
         _cprint(labels.get(self.tool_progress_mode, ""))
 
+    def _toggle_code_highlight(self):
+        """Toggle syntax-highlighted code preview for execute_code."""
+        self._code_highlight_enabled = not self._code_highlight_enabled
+        from agent.display import set_code_highlight_active
+        set_code_highlight_active(self._code_highlight_enabled)
+        from hermes_cli.colors import Colors as _Colors
+        if self._code_highlight_enabled:
+            _cprint(f"{_Colors.GREEN}Code highlight: ON{_Colors.RESET} — execute_code will show syntax-highlighted Python.")
+        else:
+            _cprint(f"{_Colors.DIM}Code highlight: OFF{_Colors.RESET} — execute_code preview disabled.")
+
     def _toggle_yolo(self):
         """Toggle YOLO mode — skip all dangerous command approval prompts."""
         import os
@@ -5035,8 +5092,16 @@ class HermesCLI:
             logger.debug("Edit snapshot capture failed for %s", function_name, exc_info=True)
 
     def _on_tool_complete(self, tool_call_id: str, function_name: str, function_args: dict, function_result: str):
-        """Render file edits with inline diff after write-capable tools complete."""
+        """Render file edits with inline diff / code preview after tools complete.
+
+        Both features are suppressed when tool_progress_mode is "off" — that
+        mode promises "silent, just the final response".
+        """
         snapshot = self._pending_edit_snapshots.pop(tool_call_id, None)
+
+        if self.tool_progress_mode == "off":
+            return
+
         try:
             from agent.display import render_edit_diff_with_delta
 
@@ -5049,6 +5114,24 @@ class HermesCLI:
             )
         except Exception:
             logger.debug("Edit diff preview failed for %s", function_name, exc_info=True)
+
+        if self._code_highlight_enabled:
+            try:
+                from agent.display import (
+                    _result_succeeded,
+                    render_execute_code_preview,
+                    render_read_file_preview,
+                    render_terminal_preview,
+                )
+                if function_name == "execute_code":
+                    if _result_succeeded(function_result):
+                        render_execute_code_preview(function_args.get("code", ""), print_fn=_cprint)
+                elif function_name == "read_file":
+                    render_read_file_preview(function_args.get("path", ""), function_result, print_fn=_cprint)
+                elif function_name == "terminal":
+                    render_terminal_preview(function_args.get("command", ""), function_result, print_fn=_cprint)
+            except Exception:
+                logger.debug("%s highlight failed", function_name, exc_info=True)
 
     # ====================================================================
     # Voice mode methods
@@ -6088,8 +6171,11 @@ class HermesCLI:
                     pass
                 else:
                     _chat_console = ChatConsole()
+                    _rendered_response = (
+                        _format_response(response) if _RICH_RESPONSE else response
+                    )
                     _chat_console.print(Panel(
-                        _rich_text_from_ansi(response),
+                        _rich_text_from_ansi(_rendered_response),
                         title=f"[{_resp_color} bold]{label}[/]",
                         title_align="left",
                         border_style=_resp_color,

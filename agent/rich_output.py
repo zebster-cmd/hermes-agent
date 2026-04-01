@@ -643,6 +643,106 @@ class DiffRenderer:
 
 
 # ---------------------------------------------------------------------------
+# Public: fenced code block highlighting for LLM responses
+# ---------------------------------------------------------------------------
+
+def format_response(text: str) -> str:
+    """Apply syntax highlighting to fenced code blocks in a complete response string.
+
+    Replaces each `` ```lang\\ncode\\n``` `` block with an ANSI-highlighted
+    version.  Blocks with no language hint use content-based detection.
+    Suitable for the non-streaming Rich Panel display path.
+    """
+    _hl = SyntaxHighlighter()
+    _det = LanguageDetector()
+
+    def _highlight(m: "re.Match") -> str:
+        lang = m.group(1).strip() or None
+        code = m.group(2)
+        if not lang:
+            lang = _det.detect_from_content(code)
+        # Preserve the fence delimiters so the Panel still looks like a code block
+        fence = f"```{m.group(1)}"
+        highlighted = _hl.to_ansi(code, language=lang).rstrip("\n")
+        return f"{fence}\n{highlighted}\n```"
+
+    return re.sub(r"```(\w*)\n(.*?)```", _highlight, text, flags=re.DOTALL)
+
+
+class StreamingCodeBlockHighlighter:
+    """State machine that syntax-highlights fenced code blocks during streaming.
+
+    Feed lines one at a time with ``process_line()``.  Regular lines are
+    returned immediately; lines inside a code block are buffered and the
+    entire highlighted block is returned when the closing fence arrives.
+
+    Example usage in a line-emission loop::
+
+        hl = StreamingCodeBlockHighlighter()
+        for line in stream_lines:
+            out = hl.process_line(line)
+            if out is not None:
+                emit(out)
+        # End of stream — flush any unclosed block
+        tail = hl.flush()
+        if tail is not None:
+            emit(tail)
+    """
+
+    def __init__(self) -> None:
+        self._in_block: bool = False
+        self._lang: Optional[str] = None
+        self._buf: list[str] = []
+        self._hl = SyntaxHighlighter()
+        self._det = LanguageDetector()
+
+    def process_line(self, line: str) -> Optional[str]:
+        """Process one line.
+
+        Returns the string to emit (may be multi-line for a highlighted block),
+        or ``None`` to suppress the line (still accumulating a code block).
+        """
+        stripped = line.strip()
+
+        if not self._in_block:
+            if stripped.startswith("```"):
+                self._in_block = True
+                self._lang = stripped[3:].strip() or None
+                self._buf = []
+                return None  # suppress opening fence — will re-emit with block
+            return line  # plain text, pass through
+
+        # Inside a code block
+        if stripped == "```":
+            # Closing fence — highlight and flush
+            return self._flush_block()
+        else:
+            self._buf.append(line)
+            return None  # still accumulating
+
+    def flush(self) -> Optional[str]:
+        """Flush any open (unclosed) code block at end of stream."""
+        if self._in_block and self._buf:
+            return self._flush_block()
+        return None
+
+    def reset(self) -> None:
+        """Reset state for a new response turn."""
+        self._in_block = False
+        self._lang = None
+        self._buf = []
+
+    def _flush_block(self) -> str:
+        code = "\n".join(self._buf)
+        lang = self._lang or self._det.detect_from_content(code)
+        highlighted = self._hl.to_ansi(code, language=lang).rstrip("\n")
+        self._in_block = False
+        self._lang = None
+        self._buf = []
+        return highlighted
+
+
+# ---------------------------------------------------------------------------
 # Public: output noise cleaning
 # ---------------------------------------------------------------------------
 

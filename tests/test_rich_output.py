@@ -1,14 +1,18 @@
 """Tests for agent/rich_output.py — syntax highlighting, diff rendering, code block detection."""
 
 import pytest
+from unittest.mock import patch
 
 from agent.rich_output import (
     DiffRenderer,
     FilePathFormatter,
     LanguageDetector,
+    StreamingCodeBlockHighlighter,
     SyntaxHighlighter,
     _intra_diff,
     _parse_diff_filename,
+    clean_command_output,
+    format_response,
 )
 
 
@@ -178,6 +182,174 @@ class TestDiffRenderer:
     def test_to_lines_does_not_crash_on_malformed_diff(self):
         result = self.dr.to_lines("not a real diff at all\njust some text\n")
         assert isinstance(result, list)
+
+
+# ---------------------------------------------------------------------------
+# StreamingCodeBlockHighlighter
+# ---------------------------------------------------------------------------
+
+class TestStreamingCodeBlockHighlighter:
+    def setup_method(self):
+        self.hl = StreamingCodeBlockHighlighter()
+
+    def test_plain_lines_pass_through(self):
+        assert self.hl.process_line("Hello world") == "Hello world"
+        assert self.hl.process_line("Another line") == "Another line"
+
+    def test_opening_fence_suppressed(self):
+        assert self.hl.process_line("```python") is None
+
+    def test_code_lines_buffered(self):
+        self.hl.process_line("```python")
+        assert self.hl.process_line("x = 1") is None
+        assert self.hl.process_line("y = 2") is None
+
+    def test_closing_fence_flushes_highlighted(self):
+        self.hl.process_line("```python")
+        self.hl.process_line("x = 1")
+        result = self.hl.process_line("```")
+        assert result is not None
+        assert "x" in result
+
+    def test_full_code_block_sequence(self):
+        lines = ["Here is code:", "```python", "def foo(): pass", "```", "Done."]
+        outputs = []
+        for line in lines:
+            out = self.hl.process_line(line)
+            if out is not None:
+                outputs.append(out)
+        tail = self.hl.flush()
+        if tail:
+            outputs.append(tail)
+
+        combined = "\n".join(outputs)
+        assert "Here is code:" in combined
+        assert "foo" in combined
+        assert "Done." in combined
+
+    def test_flush_returns_none_when_no_open_block(self):
+        assert self.hl.flush() is None
+
+    def test_flush_returns_content_for_unclosed_block(self):
+        self.hl.process_line("```python")
+        self.hl.process_line("x = 1")
+        result = self.hl.flush()
+        assert result is not None
+        assert "x" in result
+
+    def test_reset_clears_state(self):
+        self.hl.process_line("```python")
+        self.hl.process_line("x = 1")
+        self.hl.reset()
+        assert self.hl.flush() is None
+        # Should behave as fresh after reset
+        assert self.hl.process_line("normal line") == "normal line"
+
+    def test_multiple_blocks_in_sequence(self):
+        lines = [
+            "Block one:", "```python", "a = 1", "```",
+            "Block two:", "```javascript", "var b = 2;", "```",
+        ]
+        outputs = [self.hl.process_line(l) for l in lines]
+        non_none = [o for o in outputs if o is not None]
+        assert len(non_none) == 4  # "Block one:", highlighted, "Block two:", highlighted
+
+    def test_no_language_hint_still_works(self):
+        self.hl.process_line("```")
+        self.hl.process_line("SELECT * FROM users;")
+        result = self.hl.process_line("```")
+        assert result is not None
+        assert "SELECT" in result
+
+    def test_lang_hint_passed_to_highlighter(self):
+        """Opening fence ```python should call to_ansi with language='python'."""
+        with patch.object(self.hl._hl, "to_ansi", return_value="highlighted") as mock_ansi:
+            self.hl.process_line("```python")
+            self.hl.process_line("x = 1")
+            self.hl.process_line("```")
+        mock_ansi.assert_called_once()
+        _, kwargs = mock_ansi.call_args
+        assert kwargs.get("language") == "python"
+
+    def test_no_lang_hint_calls_content_detection(self):
+        """Opening fence with no hint should fall back to detect_from_content."""
+        with patch.object(self.hl._det, "detect_from_content", return_value=None) as mock_det:
+            self.hl.process_line("```")
+            self.hl.process_line("x = 1")
+            self.hl.process_line("```")
+        mock_det.assert_called_once()
+
+
+# ---------------------------------------------------------------------------
+# format_response
+# ---------------------------------------------------------------------------
+
+class TestFormatResponse:
+    def test_plain_text_unchanged(self):
+        text = "No code here, just text."
+        result = format_response(text)
+        assert "No code here, just text." in result
+
+    def test_code_block_highlighted(self):
+        text = "Here:\n```python\ndef foo(): pass\n```\nDone."
+        result = format_response(text)
+        assert "foo" in result
+        assert "Here:" in result
+        assert "Done." in result
+
+    def test_multiple_code_blocks(self):
+        text = "First:\n```python\nx = 1\n```\nSecond:\n```javascript\nvar y = 2;\n```"
+        result = format_response(text)
+        assert "x" in result
+        assert "y" in result
+
+    def test_no_code_blocks_returns_original(self):
+        text = "Just a response with no fences."
+        assert format_response(text) == text
+
+    def test_empty_string(self):
+        assert format_response("") == ""
+
+    def test_code_block_without_language(self):
+        text = "```\nSELECT * FROM t;\n```"
+        result = format_response(text)
+        assert "SELECT" in result
+
+    def test_no_lang_hint_calls_content_detection(self):
+        """Fence with no lang tag should call LanguageDetector.detect_from_content."""
+        from unittest.mock import patch, MagicMock
+        with patch("agent.rich_output.LanguageDetector") as MockLD:
+            mock_instance = MagicMock()
+            mock_instance.detect_from_content.return_value = None
+            MockLD.return_value = mock_instance
+            format_response("```\nSELECT * FROM t;\n```")
+        mock_instance.detect_from_content.assert_called_once()
+
+
+# ---------------------------------------------------------------------------
+# clean_command_output
+# ---------------------------------------------------------------------------
+
+class TestCleanCommandOutput:
+    def test_strips_venv_paths(self):
+        noisy = "/home/user/venv/lib/python3.11/site-packages/foo.py\nActual output"
+        result = clean_command_output(noisy)
+        assert "site-packages" not in result
+        assert "Actual output" in result
+
+    def test_keeps_meaningful_lines(self):
+        output = "Build succeeded\n3 tests passed\nDone."
+        result = clean_command_output(output)
+        assert "Build succeeded" in result
+        assert "3 tests passed" in result
+
+    def test_empty_string(self):
+        assert clean_command_output("") == ""
+
+    def test_removes_excessive_blank_lines(self):
+        output = "line1\n\n\n\n\nline2"
+        result = clean_command_output(output)
+        assert result.count("\n") < 3
 
 
 # ---------------------------------------------------------------------------

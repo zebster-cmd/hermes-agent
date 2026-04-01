@@ -29,13 +29,26 @@ _ANSI_PLUS = "\033[38;2;255;255;255;48;2;20;90;20m"
 _MAX_INLINE_DIFF_FILES = 6
 _MAX_INLINE_DIFF_LINES = 80
 
+# Set to True by the CLI when code-highlight mode is active.  Consumed by
+# get_cute_tool_message to suppress the inline code snippet (the highlighted
+# block will show the full code immediately after).
+_code_highlight_active: bool = False
+
+
+def set_code_highlight_active(active: bool) -> None:
+    global _code_highlight_active
+    _code_highlight_active = active
+
+
 # Rich-based rendering (syntax highlighting + enhanced diffs)
 try:
     from agent.rich_output import DiffRenderer as _RichDiffRenderer
+    from agent.rich_output import LanguageDetector as _RichLanguageDetector
     from agent.rich_output import SyntaxHighlighter as _RichSyntaxHighlighter
     from agent.rich_output import clean_command_output
     _rich_diff = _RichDiffRenderer()
     _rich_syntax = _RichSyntaxHighlighter()
+    _rich_detector = _RichLanguageDetector()
     _RICH_OUTPUT = True
 except ImportError:
     _RICH_OUTPUT = False
@@ -572,6 +585,172 @@ def render_edit_diff_with_delta(
 
 
 # =========================================================================
+# execute_code / read_file / terminal syntax highlight previews
+# =========================================================================
+
+def _highlight_block(header: str, content: str, language: str, print_fn) -> bool:
+    """Print a labelled syntax-highlighted block aligned with the ┊ tool log.
+
+    Format::
+
+        \033[2m  ┊ <header>\033[0m
+        <highlighted content lines>
+    """
+    _print = print_fn or print
+    _print(f"\033[2m  ┊ {header}\033[0m")
+    if not _RICH_OUTPUT:
+        for line in content.rstrip("\n").splitlines():
+            _print(line)
+        return True
+    try:
+        highlighted = _rich_syntax.to_ansi(content, language=language).rstrip("\n")
+        for line in highlighted.splitlines():
+            _print(line)
+        return True
+    except Exception as exc:
+        logger.debug("highlight_block failed for %s: %s", header, exc)
+        return False
+
+
+def render_execute_code_preview(code: str, print_fn=None) -> bool:
+    """Print *code* with Python syntax highlighting.
+
+    The cute_msg line already labels the tool; this function prints only the
+    highlighted code (no header) so the output stays compact.
+    Returns True if anything was printed.
+    """
+    if not code or not code.strip():
+        return False
+    _print = print_fn or print
+    if not _RICH_OUTPUT:
+        for line in code.rstrip("\n").splitlines():
+            _print(line)
+        return True
+    try:
+        highlighted = _rich_syntax.to_ansi(code, language="python").rstrip("\n")
+        for line in highlighted.splitlines():
+            _print(line)
+        return True
+    except Exception as exc:
+        logger.debug("execute_code highlight failed: %s", exc)
+        return False
+
+
+def render_read_file_preview(path: str, result_json: str, print_fn=None) -> bool:
+    """Print the content of a read_file result with syntax highlighting.
+
+    Language is detected from *path*'s extension.  Returns False (no output)
+    when the file type is unknown — we don't highlight plain text or binary.
+    """
+    if not path or not result_json:
+        return False
+    try:
+        import json as _json
+        result = _json.loads(result_json)
+        content = result.get("content", "")
+    except Exception:
+        return False
+    if not content or not content.strip():
+        return False
+
+    from pathlib import Path as _Path
+    if _RICH_OUTPUT:
+        lang = _rich_detector.detect_from_filename(_Path(path).name)
+    else:
+        lang = None
+    if not lang:
+        return False  # unknown type — skip, don't guess
+
+    header = f"📄 {_Path(path).name}"
+    return _highlight_block(header, content, lang, print_fn)
+
+
+_FILE_READ_COMMANDS = frozenset({
+    "cat", "head", "tail", "less", "more", "bat",
+    "sed", "awk", "grep", "cut", "sort", "uniq",
+    "nl", "od", "xxd", "hexdump",
+})
+
+# Commands that *execute* a file rather than reading it — the terminal output
+# will be runtime stdout, not source code.  Never highlight for these.
+_FILE_EXEC_COMMANDS = frozenset({
+    "python", "python3", "python2",
+    "node", "nodejs", "deno", "bun",
+    "ruby", "perl", "php", "lua",
+    "bash", "sh", "zsh", "fish", "dash",
+    "Rscript", "julia",
+})
+
+
+def _extract_file_language_from_command(command: str):
+    """Return (filename, language) if *command* is clearly reading a known source file.
+
+    Only fires when the leading verb is a known file-reader (cat, head, sed …).
+    Commands that *execute* files (node, python, bash …) are explicitly excluded
+    — their stdout is runtime output, not source code.
+
+    Parses tokens in reverse (file arg is typically last) and returns the first
+    token whose extension maps to a known language.  Returns (None, None) if no
+    match — we never fall back to content-based detection for shell output.
+    """
+    if not command:
+        return None, None
+    try:
+        import shlex as _shlex
+        tokens = _shlex.split(command)
+    except ValueError:
+        tokens = command.split()
+
+    if not tokens:
+        return None, None
+
+    # Check the leading verb (strip path prefix, e.g. /usr/bin/cat → cat)
+    from pathlib import Path as _Path
+    verb = _Path(tokens[0]).name
+    if verb in _FILE_EXEC_COMMANDS:
+        return None, None
+
+    if not _RICH_OUTPUT:
+        return None, None
+
+    for tok in reversed(tokens):
+        if tok.startswith("-"):
+            continue
+        # Only consider tokens that look like a file path (contain a dot or slash)
+        if "." not in _Path(tok).name:
+            continue
+        lang = _rich_detector.detect_from_filename(_Path(tok).name)
+        if lang:
+            return _Path(tok).name, lang
+    return None, None
+
+
+def render_terminal_preview(command: str, result_json: str, print_fn=None) -> bool:
+    """Print terminal output with syntax highlighting when the command reads a source file.
+
+    Highlighting is only applied when a known-extension filename can be extracted
+    from *command* (e.g. ``cat foo.py``, ``sed -n '1,50p' app.ts``).
+    Returns False without printing anything if the language cannot be determined.
+    """
+    if not command or not result_json:
+        return False
+    filename, lang = _extract_file_language_from_command(command)
+    if not lang:
+        return False
+    try:
+        import json as _json
+        result = _json.loads(result_json)
+        output = result.get("output", "")
+    except Exception:
+        return False
+    if not output or not output.strip():
+        return False
+
+    header = f"💻 {filename}"
+    return _highlight_block(header, output, lang, print_fn)
+
+
+# =========================================================================
 # KawaiiSpinner
 # =========================================================================
 
@@ -990,6 +1169,8 @@ def get_cute_tool_message(
         }
         return _wrap(f"┊ 🧪 rl        {rl.get(tool_name, tool_name.replace('rl_', ''))}  {dur}")
     if tool_name == "execute_code":
+        if _code_highlight_active:
+            return _wrap(f"┊ 🐍 exec      {dur}")
         code = args.get("code", "")
         first_line = code.strip().split("\n")[0] if code.strip() else ""
         return _wrap(f"┊ 🐍 exec      {_trunc(first_line, 35)}  {dur}")
