@@ -7,6 +7,7 @@ import pytest
 from unittest.mock import MagicMock, patch
 
 from agent.display import (
+    _HIGHLIGHT_MAX_LINES,
     _highlight_block,
     _result_succeeded,
     build_tool_preview,
@@ -123,7 +124,7 @@ class TestEditDiffPreview:
         import re as _re
         _strip = lambda s: _re.sub(r"\x1b\[[0-9;]*m", "", s)
         stripped = [_strip(l) for l in rendered]
-        # header shows basename + change summary, not a/x → b/x
+        # v2 header shows basename + change summary, not a/x → b/x
         assert "cli.py" in stripped[0]
         assert any("old line" in l for l in stripped)
         assert any("new line" in l for l in stripped)
@@ -165,7 +166,7 @@ class TestEditDiffPreview:
         assert rendered is True
         assert printer.call_count >= 2
         calls = [call.args[0] for call in printer.call_args_list]
-        # header shows basename + change summary
+        # v2 header shows basename + change summary
         assert any("x" in line for line in calls)
         assert any("old" in line for line in calls)
         assert any("new" in line for line in calls)
@@ -208,7 +209,7 @@ class TestEditDiffPreview:
 
         rendered = _summarize_rendered_diff_sections(diff, max_files=3, max_lines=50)
 
-        # header shows basename only
+        # v2 header shows basename only
         assert any("file0.py" in line for line in rendered)
         assert any("file1.py" in line for line in rendered)
         assert any("file2.py" in line for line in rendered)
@@ -420,6 +421,47 @@ class TestCuteMessageDedup:
 # ---------------------------------------------------------------------------
 # _result_succeeded gate (guards execute_code preview on error)
 # ---------------------------------------------------------------------------
+
+class TestHighlightTruncation:
+    """_emit_highlighted_lines truncates at _HIGHLIGHT_MAX_LINES."""
+
+    def _collect(self, content: str, language: str = "python") -> list[str]:
+        lines = []
+        _highlight_block("test", content, language, print_fn=lines.append)
+        return lines  # includes the header line
+
+    def test_short_content_not_truncated(self):
+        code = "\n".join(f"x = {i}" for i in range(10))
+        out = self._collect(code)
+        assert not any("omitted" in l for l in out)
+        _ansi = re.compile(r"\x1b\[[0-9;]*m")
+        assert any("x = 9" in _ansi.sub("", l) for l in out)
+
+    def test_long_content_truncated(self):
+        code = "\n".join(f"x = {i}" for i in range(_HIGHLIGHT_MAX_LINES + 20))
+        out = self._collect(code)
+        assert any("omitted" in l for l in out)
+        # Should not contain lines beyond the cap
+        assert not any(f"x = {_HIGHLIGHT_MAX_LINES + 1}" in l for l in out)
+
+    def test_omission_footer_shows_correct_count(self):
+        extra = 15
+        code = "\n".join(f"x = {i}" for i in range(_HIGHLIGHT_MAX_LINES + extra))
+        out = self._collect(code)
+        footer = next(l for l in out if "omitted" in l)
+        assert str(extra) in footer
+
+    def test_exactly_at_limit_not_truncated(self):
+        code = "\n".join(f"x = {i}" for i in range(_HIGHLIGHT_MAX_LINES))
+        out = self._collect(code)
+        assert not any("omitted" in l for l in out)
+
+    def test_execute_code_preview_truncates(self):
+        code = "\n".join(f"x = {i}" for i in range(_HIGHLIGHT_MAX_LINES + 10))
+        lines = []
+        render_execute_code_preview(code, print_fn=lines.append)
+        assert any("omitted" in l for l in lines)
+
 
 class TestResultSucceededGate:
     def test_error_status_fails(self):

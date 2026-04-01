@@ -470,7 +470,10 @@ except Exception:
 
 # Rich-based response highlighting (syntax highlight fenced code blocks)
 try:
+    import agent.display as _display
     from agent.rich_output import StreamingCodeBlockHighlighter as _CodeBlockHL
+    from agent.rich_output import apply_block_line as _apply_block_line
+    from agent.rich_output import apply_inline_markdown as _apply_inline_md
     from agent.rich_output import format_response as _format_response
     _RICH_RESPONSE = True
 except ImportError:
@@ -1107,7 +1110,6 @@ class HermesCLI:
         self._stream_box_opened = False  # True once the response box header is printed
         self._reasoning_stream_started = False  # True once live reasoning starts streaming
         self._reasoning_preview_buf = ""  # Coalesce tiny reasoning chunks for [thinking] output
-        self._stream_code_hl = _CodeBlockHL() if _RICH_RESPONSE else None
         self._pending_edit_snapshots = {}
         
         # Configuration - priority: CLI args > env vars > config file
@@ -1891,15 +1893,15 @@ class HermesCLI:
                 if out is None:
                     continue  # buffering a code block
                 if out is line:
-                    # Plain text — preserve response text colour
-                    _cprint(f"{_tc}{out}{_RST}" if _tc else out)
-                elif "\n" in out:
-                    # Multi-line highlighted block — has its own ANSI colours
+                    # Plain text — apply block + inline markdown then response text colour.
+                    # Always apply when _RICH_RESPONSE is True; _code_highlight_active only
+                    # gates tool-output syntax highlighting, not LLM response rendering.
+                    line = _apply_inline_md(_apply_block_line(line), reset_suffix=_tc)
+                    _cprint(f"{_tc}{line}{_RST}" if _tc else line)
+                else:
+                    # Highlighted code block — emit as-is (carries its own ANSI)
                     for hl_line in out.splitlines():
                         _cprint(hl_line)
-                else:
-                    # Single-line highlighted block
-                    _cprint(out)
             else:
                 _cprint(f"{_tc}{line}{_RST}" if _tc else line)
 
@@ -1911,13 +1913,11 @@ class HermesCLI:
         if self._stream_buf:
             _tc = getattr(self, "_stream_text_ansi", "")
             if _RICH_RESPONSE:
-                buf = self._stream_buf
-                out = self._stream_code_hl.process_line(buf)
+                out = self._stream_code_hl.process_line(self._stream_buf)
                 if out is not None:
-                    if out is buf:
-                        _cprint(f"{_tc}{out}{_RST}" if _tc else out)
-                    else:
-                        _cprint(out)
+                    if out is self._stream_buf:
+                        out = _apply_inline_md(_apply_block_line(out), reset_suffix=_tc)
+                    _cprint(f"{_tc}{out}{_RST}" if _tc else out)
                 # Flush any open code block (unclosed fence at end of response)
                 tail = self._stream_code_hl.flush()
                 if tail:
@@ -1944,7 +1944,10 @@ class HermesCLI:
         self._reasoning_buf = ""
         self._reasoning_preview_buf = ""
         if _RICH_RESPONSE:
-            self._stream_code_hl.reset()
+            if not hasattr(self, "_stream_code_hl"):
+                self._stream_code_hl = _CodeBlockHL()
+            else:
+                self._stream_code_hl.reset()
 
     def _slow_command_status(self, command: str) -> str:
         """Return a user-facing status message for slower slash commands."""
@@ -3932,7 +3935,7 @@ class HermesCLI:
             self.console.print(f"  Status bar {state}")
         elif canonical == "verbose":
             self._toggle_verbose()
-        elif canonical == "code-highlight":
+        elif canonical in ("code-highlight", "codehighlight", "code_highlight"):
             self._toggle_code_highlight()
         elif canonical == "yolo":
             self._toggle_yolo()

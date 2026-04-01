@@ -43,12 +43,10 @@ def set_code_highlight_active(active: bool) -> None:
 # Rich-based rendering (syntax highlighting + enhanced diffs)
 try:
     from agent.rich_output import DiffRenderer as _RichDiffRenderer
-    from agent.rich_output import LanguageDetector as _RichLanguageDetector
     from agent.rich_output import SyntaxHighlighter as _RichSyntaxHighlighter
     from agent.rich_output import clean_command_output
     _rich_diff = _RichDiffRenderer()
     _rich_syntax = _RichSyntaxHighlighter()
-    _rich_detector = _RichLanguageDetector()
     _RICH_OUTPUT = True
 except ImportError:
     _RICH_OUTPUT = False
@@ -588,6 +586,22 @@ def render_edit_diff_with_delta(
 # execute_code / read_file / terminal syntax highlight previews
 # =========================================================================
 
+_HIGHLIGHT_MAX_LINES = 40
+
+
+def _emit_highlighted_lines(lines: list[str], print_fn) -> None:
+    """Print *lines*, truncating at _HIGHLIGHT_MAX_LINES with a dim footer."""
+    _print = print_fn or print
+    if len(lines) <= _HIGHLIGHT_MAX_LINES:
+        for line in lines:
+            _print(line)
+    else:
+        for line in lines[:_HIGHLIGHT_MAX_LINES]:
+            _print(line)
+        omitted = len(lines) - _HIGHLIGHT_MAX_LINES
+        _print(f"\033[2m   ╌╌ {omitted} more line{'s' if omitted != 1 else ''} omitted ╌╌\033[0m")
+
+
 def _highlight_block(header: str, content: str, language: str, print_fn) -> bool:
     """Print a labelled syntax-highlighted block aligned with the ┊ tool log.
 
@@ -599,13 +613,11 @@ def _highlight_block(header: str, content: str, language: str, print_fn) -> bool
     _print = print_fn or print
     _print(f"\033[2m  ┊ {header}\033[0m")
     if not _RICH_OUTPUT:
-        for line in content.rstrip("\n").splitlines():
-            _print(line)
+        _emit_highlighted_lines(content.rstrip("\n").splitlines(), _print)
         return True
     try:
         highlighted = _rich_syntax.to_ansi(content, language=language).rstrip("\n")
-        for line in highlighted.splitlines():
-            _print(line)
+        _emit_highlighted_lines(highlighted.splitlines(), _print)
         return True
     except Exception as exc:
         logger.debug("highlight_block failed for %s: %s", header, exc)
@@ -623,13 +635,11 @@ def render_execute_code_preview(code: str, print_fn=None) -> bool:
         return False
     _print = print_fn or print
     if not _RICH_OUTPUT:
-        for line in code.rstrip("\n").splitlines():
-            _print(line)
+        _emit_highlighted_lines(code.rstrip("\n").splitlines(), _print)
         return True
     try:
         highlighted = _rich_syntax.to_ansi(code, language="python").rstrip("\n")
-        for line in highlighted.splitlines():
-            _print(line)
+        _emit_highlighted_lines(highlighted.splitlines(), _print)
         return True
     except Exception as exc:
         logger.debug("execute_code highlight failed: %s", exc)
@@ -655,7 +665,8 @@ def render_read_file_preview(path: str, result_json: str, print_fn=None) -> bool
 
     from pathlib import Path as _Path
     if _RICH_OUTPUT:
-        lang = _rich_detector.detect_from_filename(_Path(path).name)
+        from agent.rich_output import LanguageDetector as _LD
+        lang = _LD().detect_from_filename(_Path(path).name)
     else:
         lang = None
     if not lang:
@@ -709,8 +720,16 @@ def _extract_file_language_from_command(command: str):
     verb = _Path(tokens[0]).name
     if verb in _FILE_EXEC_COMMANDS:
         return None, None
+    if _FILE_READ_COMMANDS and verb not in _FILE_READ_COMMANDS:
+        # Not in the explicit read list — only proceed if it's clearly not an
+        # executor.  Unknown commands might be aliases like 'bat' equivalents;
+        # allow them through so we don't over-block.
+        pass
 
-    if not _RICH_OUTPUT:
+    if _RICH_OUTPUT:
+        from agent.rich_output import LanguageDetector as _LD
+        detector = _LD()
+    else:
         return None, None
 
     for tok in reversed(tokens):
@@ -719,7 +738,7 @@ def _extract_file_language_from_command(command: str):
         # Only consider tokens that look like a file path (contain a dot or slash)
         if "." not in _Path(tok).name:
             continue
-        lang = _rich_detector.detect_from_filename(_Path(tok).name)
+        lang = detector.detect_from_filename(_Path(tok).name)
         if lang:
             return _Path(tok).name, lang
     return None, None
