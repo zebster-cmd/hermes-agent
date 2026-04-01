@@ -650,7 +650,7 @@ _MD_ITALIC_UNDER_RE = re.compile(r"(?<![_\w])_([^_\n]+)_(?![_\w])")
 _MD_STRIKE_RE = re.compile(r"~~(.+?)~~")
 # Images must be matched before links (![  prefix overlaps with [)
 _MD_IMAGE_RE = re.compile(r"!\[([^\]]*)\]\([^)]+\)")
-_MD_LINK_RE = re.compile(r"\[([^\]]+)\]\([^)]+\)")
+_MD_LINK_RE = re.compile(r"\[([^\]]+)\]\(([^)]+)\)")
 _MD_EM_RE = re.compile(r"<em>(.*?)</em>", re.IGNORECASE)
 _MD_STRONG_RE = re.compile(r"<strong>(.*?)</strong>", re.IGNORECASE)
 
@@ -705,7 +705,7 @@ def apply_inline_markdown(line: str, reset_suffix: str = "") -> str:
     line = _MD_IMAGE_RE.sub(lambda m: f"\033[2m[img: {m.group(1)}]\033[0m{reset_suffix}", line)
 
     # Step 5b: links — underline text, discard URL
-    line = _MD_LINK_RE.sub(lambda m: f"\033[4m{m.group(1)}\033[0m{reset_suffix}", line)
+    line = _MD_LINK_RE.sub(lambda m: f"\033[4m{m.group(1)} ({m.group(2)})\033[0m{reset_suffix}", line)
 
     # Step 5c: HTML inline tags
     line = _MD_EM_RE.sub(lambda m: f"{_MD_ITALIC_ANSI}{m.group(1)}\033[0m{reset_suffix}", line)
@@ -832,7 +832,7 @@ def format_response(text: str) -> str:
 
     # Match fenced code blocks of any depth (3+ backticks); \1 backreference
     # ensures the closing fence uses the same backtick sequence as the opener.
-    text = re.sub(r"(`{3,})(\w*)\n(.*?)\1", _highlight, text, flags=re.DOTALL)
+    text = re.sub(r"(?m)^(`{3,})(\w*)\n(.*?)\1", _highlight, text, flags=re.DOTALL)
     # Block + inline markdown pass — lines with \x1b are already highlighted code.
     # Use splitlines() (no keepends) so apply_block_line never receives a trailing
     # \n that its capture groups would silently drop.  Rejoin manually and restore
