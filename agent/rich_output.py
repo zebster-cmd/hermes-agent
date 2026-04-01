@@ -254,7 +254,7 @@ class _PygmentsToRich:
             Generic.Deleted: "red",
             Generic.Inserted: "green",
             Generic.Error: "bold red",
-            Error: "bold red on red",
+            Error: "bold red",
         }
 
     def format(self, tokens) -> str:
