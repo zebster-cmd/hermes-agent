@@ -29,6 +29,17 @@ _ANSI_PLUS = "\033[38;2;255;255;255;48;2;20;90;20m"
 _MAX_INLINE_DIFF_FILES = 6
 _MAX_INLINE_DIFF_LINES = 80
 
+# Rich-based rendering (syntax highlighting + enhanced diffs)
+try:
+    from agent.rich_output import DiffRenderer as _RichDiffRenderer
+    from agent.rich_output import SyntaxHighlighter as _RichSyntaxHighlighter
+    from agent.rich_output import clean_command_output
+    _rich_diff = _RichDiffRenderer()
+    _rich_syntax = _RichSyntaxHighlighter()
+    _RICH_OUTPUT = True
+except ImportError:
+    _RICH_OUTPUT = False
+
 
 @dataclass
 class LocalEditSnapshot:
@@ -411,7 +422,18 @@ def _emit_inline_diff(diff_text: str, print_fn) -> bool:
 
 
 def _render_inline_unified_diff(diff: str) -> list[str]:
-    """Render unified diff lines in Hermes' inline transcript style."""
+    """Render unified diff lines with line numbers and coloured backgrounds.
+
+    Uses rich_output.DiffRenderer when available (line numbers, green/red
+    background highlights).  Falls back to the original ANSI-string path.
+    """
+    if _RICH_OUTPUT:
+        try:
+            return _rich_diff.to_lines(diff)
+        except Exception as exc:
+            logger.debug("Rich diff render failed, using ANSI fallback: %s", exc)
+
+    # Original ANSI fallback — unchanged from upstream
     rendered: list[str] = []
     from_file = None
     to_file = None
@@ -441,6 +463,24 @@ def _render_inline_unified_diff(diff: str) -> list[str]:
             rendered.append(raw_line)
 
     return rendered
+
+
+def highlight_code(
+    code: str,
+    language: str | None = None,
+    filename: str | None = None,
+) -> str:
+    """Return an ANSI-highlighted version of *code* for terminal display.
+
+    When rich_output is unavailable the original string is returned unchanged.
+    """
+    if not _RICH_OUTPUT:
+        return code
+    try:
+        return _rich_syntax.to_ansi(code, language=language, filename=filename)
+    except Exception as exc:
+        logger.debug("highlight_code failed: %s", exc)
+        return code
 
 
 def _split_unified_diff_sections(diff: str) -> list[str]:

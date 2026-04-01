@@ -111,10 +111,13 @@ class TestEditDiffPreview:
             " context\n"
         )
 
-        assert "a/cli.py" in rendered[0]
-        assert "b/cli.py" in rendered[0]
-        assert any("old line" in line for line in rendered)
-        assert any("new line" in line for line in rendered)
+        import re as _re
+        _strip = lambda s: _re.sub(r"\x1b\[[0-9;]*m", "", s)
+        stripped = [_strip(l) for l in rendered]
+        # header shows basename + change summary, not a/x → b/x
+        assert "cli.py" in stripped[0]
+        assert any("old line" in l for l in stripped)
+        assert any("new line" in l for l in stripped)
         assert any("48;2;" in line for line in rendered)
 
     def test_extract_edit_diff_ignores_non_edit_tools(self):
@@ -153,7 +156,8 @@ class TestEditDiffPreview:
         assert rendered is True
         assert printer.call_count >= 2
         calls = [call.args[0] for call in printer.call_args_list]
-        assert any("a/x" in line and "b/x" in line for line in calls)
+        # header shows basename + change summary
+        assert any("x" in line for line in calls)
         assert any("old" in line for line in calls)
         assert any("new" in line for line in calls)
 
@@ -195,8 +199,9 @@ class TestEditDiffPreview:
 
         rendered = _summarize_rendered_diff_sections(diff, max_files=3, max_lines=50)
 
-        assert any("a/file0.py" in line for line in rendered)
-        assert any("a/file1.py" in line for line in rendered)
-        assert any("a/file2.py" in line for line in rendered)
-        assert not any("a/file7.py" in line for line in rendered)
+        # header shows basename only
+        assert any("file0.py" in line for line in rendered)
+        assert any("file1.py" in line for line in rendered)
+        assert any("file2.py" in line for line in rendered)
+        assert not any("file7.py" in line for line in rendered)
         assert "additional file" in rendered[-1]
