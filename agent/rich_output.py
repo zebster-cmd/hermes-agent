@@ -657,16 +657,16 @@ def format_response(text: str) -> str:
     _det = LanguageDetector()
 
     def _highlight(m: "re.Match") -> str:
-        lang = m.group(1).strip() or None
-        code = m.group(2)
+        lang = m.group(2).strip() or None
+        code = m.group(3)
         if not lang:
             lang = _det.detect_from_content(code)
-        # Preserve the fence delimiters so the Panel still looks like a code block
-        fence = f"```{m.group(1)}"
         highlighted = _hl.to_ansi(code, language=lang).rstrip("\n")
-        return f"{fence}\n{highlighted}\n```"
+        return highlighted
 
-    return re.sub(r"```(\w*)\n(.*?)```", _highlight, text, flags=re.DOTALL)
+    # Match fenced code blocks of any depth (3+ backticks); \1 backreference
+    # ensures the closing fence uses the same backtick sequence as the opener.
+    return re.sub(r"(`{3,})(\w*)\n(.*?)\1", _highlight, text, flags=re.DOTALL)
 
 
 class StreamingCodeBlockHighlighter:
@@ -689,9 +689,15 @@ class StreamingCodeBlockHighlighter:
             emit(tail)
     """
 
+    # Matches an opening fence: 3+ backticks, optional language hint (word chars)
+    _FENCE_OPEN_RE = re.compile(r"^(`{3,})\s*(\w*)$")
+    # Matches a closing fence: 3+ backticks, optional trailing whitespace only
+    _FENCE_CLOSE_RE = re.compile(r"^(`+)\s*$")
+
     def __init__(self) -> None:
         self._in_block: bool = False
         self._lang: Optional[str] = None
+        self._fence_depth: int = 3  # backtick count of the opening fence
         self._buf: list[str] = []
         self._hl = SyntaxHighlighter()
         self._det = LanguageDetector()
@@ -705,20 +711,21 @@ class StreamingCodeBlockHighlighter:
         stripped = line.strip()
 
         if not self._in_block:
-            if stripped.startswith("```"):
+            m = self._FENCE_OPEN_RE.match(stripped)
+            if m:
                 self._in_block = True
-                self._lang = stripped[3:].strip() or None
+                self._fence_depth = len(m.group(1))
+                self._lang = m.group(2) or None
                 self._buf = []
                 return None  # suppress opening fence — will re-emit with block
             return line  # plain text, pass through
 
-        # Inside a code block
-        if stripped == "```":
-            # Closing fence — highlight and flush
+        # Inside a code block — closing fence: >= fence_depth backticks, nothing else
+        m = self._FENCE_CLOSE_RE.match(stripped)
+        if m and len(m.group(1)) >= self._fence_depth:
             return self._flush_block()
-        else:
-            self._buf.append(line)
-            return None  # still accumulating
+        self._buf.append(line)
+        return None  # still accumulating
 
     def flush(self) -> Optional[str]:
         """Flush any open (unclosed) code block at end of stream."""
@@ -730,6 +737,7 @@ class StreamingCodeBlockHighlighter:
         """Reset state for a new response turn."""
         self._in_block = False
         self._lang = None
+        self._fence_depth = 3
         self._buf = []
 
     def _flush_block(self) -> str:

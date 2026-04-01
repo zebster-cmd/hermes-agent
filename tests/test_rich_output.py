@@ -279,6 +279,31 @@ class TestStreamingCodeBlockHighlighter:
             self.hl.process_line("```")
         mock_det.assert_called_once()
 
+    def test_four_backtick_fence_opened_and_closed(self):
+        """4-backtick opening fence is handled; 4-backtick closing fence closes it."""
+        assert self.hl.process_line("````python") is None
+        assert self.hl.process_line("x = 1") is None
+        result = self.hl.process_line("````")
+        assert result is not None
+        assert "x" in result
+
+    def test_four_backtick_fence_three_backtick_close_ignored(self):
+        """3-backtick closing fence inside a 4-backtick block is buffered, not a close."""
+        assert self.hl.process_line("````python") is None
+        assert self.hl.process_line("x = 1") is None
+        assert self.hl.process_line("```") is None  # still buffering
+        result = self.hl.flush()
+        assert result is not None
+        assert "x" in result
+
+    def test_prose_after_four_backtick_block_rendered(self):
+        """Lines after a properly-closed 4-backtick block pass through as prose."""
+        self.hl.process_line("````python")
+        self.hl.process_line("x = 1")
+        self.hl.process_line("````")
+        out = self.hl.process_line("plain text")
+        assert out == "plain text"
+
 
 # ---------------------------------------------------------------------------
 # format_response
@@ -324,6 +349,27 @@ class TestFormatResponse:
             MockLD.return_value = mock_instance
             format_response("```\nSELECT * FROM t;\n```")
         mock_instance.detect_from_content.assert_called_once()
+
+    def test_fence_delimiters_not_in_output(self):
+        """format_response must not include raw ``` in the highlighted output."""
+        text = "```python\ndef foo(): pass\n```"
+        result = format_response(text)
+        import re as _re
+        plain = _re.sub(r"\x1b\[[0-9;]*m", "", result)
+        for line in plain.splitlines():
+            assert not line.strip().startswith("```"), f"fence leaked: {line!r}"
+
+    def test_four_backtick_fence_consumed(self):
+        """format_response handles 4-backtick fences via backreference."""
+        text = "Intro.\n````python\nx = 1\n````\nDone."
+        result = format_response(text)
+        assert "Intro." in result
+        assert "Done." in result
+        assert "x" in result
+        import re as _re
+        plain = _re.sub(r"\x1b\[[0-9;]*m", "", result)
+        for line in plain.splitlines():
+            assert not line.strip().startswith("````"), f"4-backtick fence leaked: {line!r}"
 
 
 # ---------------------------------------------------------------------------
