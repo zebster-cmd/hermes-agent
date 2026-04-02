@@ -1061,9 +1061,14 @@ class AIAgent:
                     from agent.memory_manager import MemoryManager as _MemoryManager
                     from plugins.memory import load_memory_provider as _load_mem
                     self._memory_manager = _MemoryManager()
-                    _mp = _load_mem(_mem_provider_name)
-                    if _mp and _mp.is_available():
-                        self._memory_manager.add_provider(_mp)
+                    _provider_names = [n.strip() for n in _mem_provider_name.split(",") if n.strip()]
+                    for _pname in _provider_names:
+                        _mp = _load_mem(_pname)
+                        if _mp and _mp.is_available():
+                            self._memory_manager.add_provider(_mp)
+                            logger.info("Memory provider '%s' activated", _pname)
+                        else:
+                            logger.debug("Memory provider '%s' not found or not available", _pname)
                     if self._memory_manager.providers:
                         from hermes_constants import get_hermes_home as _ghh
                         self._memory_manager.initialize_all(
@@ -1071,9 +1076,7 @@ class AIAgent:
                             platform=platform or "cli",
                             hermes_home=str(_ghh()),
                         )
-                        logger.info("Memory provider '%s' activated", _mem_provider_name)
                     else:
-                        logger.debug("Memory provider '%s' not found or not available", _mem_provider_name)
                         self._memory_manager = None
             except Exception as _mpe:
                 logger.warning("Memory provider plugin init failed: %s", _mpe)

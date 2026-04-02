@@ -55,24 +55,10 @@ class MemoryManager:
         """Register a memory provider.
 
         Built-in provider (name ``"builtin"``) is always accepted.
-        Only **one** external (non-builtin) provider is allowed — a second
-        attempt is rejected with a warning.
+        Multiple external providers are supported — configure them as a
+        comma-separated list in ``memory.provider`` (e.g. ``honcho,openviking``).
         """
-        is_builtin = provider.name == "builtin"
-
-        if not is_builtin:
-            if self._has_external:
-                existing = next(
-                    (p.name for p in self._providers if p.name != "builtin"), "unknown"
-                )
-                logger.warning(
-                    "Rejected memory provider '%s' — external provider '%s' is "
-                    "already registered. Only one external memory provider is "
-                    "allowed at a time. Configure which one via memory.provider "
-                    "in config.yaml.",
-                    provider.name, existing,
-                )
-                return
+        if provider.name != "builtin":
             self._has_external = True
 
         self._providers.append(provider)
