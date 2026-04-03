@@ -157,6 +157,7 @@ def _discover_tools():
         "tools.process_registry",
         "tools.send_message_tool",
         # "tools.honcho_tools",  # Removed — Honcho is now a memory provider plugin
+        "tools.honcho_tool",
         "tools.homeassistant_tool",
         "tools.openviking_tool",
     ]
