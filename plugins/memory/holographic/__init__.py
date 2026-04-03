@@ -190,7 +190,7 @@ class HolographicMemoryProvider(MemoryProvider):
             f"Use fact_feedback to rate facts after using them (trains trust scores)."
         )
 
-    def prefetch(self, query: str, *, session_id: str = "") -> str:
+    def prefetch(self, query: str) -> str:
         if not self._retriever or not query:
             return ""
         try:
@@ -206,7 +206,7 @@ class HolographicMemoryProvider(MemoryProvider):
             logger.debug("Holographic prefetch failed: %s", e)
             return ""
 
-    def sync_turn(self, user_content: str, assistant_content: str, *, session_id: str = "") -> None:
+    def sync_turn(self, user_content: str, assistant_content: str) -> None:
         # Holographic memory stores explicit facts via tools, not auto-sync.
         # The on_session_end hook handles auto-extraction if configured.
         pass

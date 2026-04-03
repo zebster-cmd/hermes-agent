@@ -74,11 +74,11 @@ class BuiltinMemoryProvider(MemoryProvider):
 
         return "\n\n".join(parts)
 
-    def prefetch(self, query: str, *, session_id: str = "") -> str:
+    def prefetch(self, query: str) -> str:
         """Built-in memory doesn't do query-based recall — it's injected via system_prompt_block."""
         return ""
 
-    def sync_turn(self, user_content: str, assistant_content: str, *, session_id: str = "") -> None:
+    def sync_turn(self, user_content: str, assistant_content: str) -> None:
         """Built-in memory doesn't auto-sync turns — writes happen via the memory tool."""
 
     def get_tool_schemas(self) -> List[Dict[str, Any]]:

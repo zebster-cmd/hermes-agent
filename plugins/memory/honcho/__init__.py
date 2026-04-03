@@ -18,7 +18,6 @@ from __future__ import annotations
 import json
 import logging
 import threading
-from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 from agent.memory_provider import MemoryProvider
@@ -33,12 +32,36 @@ logger = logging.getLogger(__name__)
 PROFILE_SCHEMA = {
     "name": "honcho_profile",
     "description": (
-        "Retrieve the user's peer card from Honcho — a curated list of key facts "
-        "about them (name, role, preferences, communication style, patterns). "
-        "Fast, no LLM reasoning, minimal cost. "
-        "Use this at conversation start or when you need a quick factual snapshot."
+        "Get or set a peer's profile card in Honcho — a curated list of stable biographical facts "
+        "(identity, occupation, relationships, preferences, traits). Max 40 facts per card.\n"
+        "Actions: 'get' (default) reads the card, 'set' overwrites it, 'add' appends facts.\n"
+        "Use 'peer' for the card owner and 'target' for directional cards (what peer knows about target).\n"
+        "Cards auto-populate during dreaming — use set/add for bootstrapping or corrections."
     ),
-    "parameters": {"type": "object", "properties": {}, "required": []},
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "action": {
+                "type": "string",
+                "enum": ["get", "set", "add"],
+                "description": "What to do: 'get' (read card), 'set' (overwrite card), 'add' (append facts). Default: get.",
+            },
+            "facts": {
+                "type": "array",
+                "items": {"type": "string"},
+                "description": "List of factual statements for set/add actions. Each string is one stable fact (not moods or transient info).",
+            },
+            "peer": {
+                "type": "string",
+                "description": "Card owner peer ID (default: user peer). Use honcho_peers to list available peers.",
+            },
+            "target": {
+                "type": "string",
+                "description": "For directional cards: get/set what 'peer' knows about 'target'. Omit for the peer's own card.",
+            },
+        },
+        "required": [],
+    },
 }
 
 SEARCH_SCHEMA = {
@@ -70,7 +93,7 @@ CONTEXT_SCHEMA = {
     "description": (
         "Ask Honcho a natural language question and get a synthesized answer. "
         "Uses Honcho's LLM (dialectic reasoning) — higher cost than honcho_profile or honcho_search. "
-        "Can query about any peer: the user (default) or the AI assistant."
+        "Can query about any peer by ID (default: user peer)."
     ),
     "parameters": {
         "type": "object",
@@ -81,7 +104,7 @@ CONTEXT_SCHEMA = {
             },
             "peer": {
                 "type": "string",
-                "description": "Which peer to query about: 'user' (default) or 'ai'.",
+                "description": "Peer ID to query about. Default: user peer. Use 'ai' for the assistant, or any peer ID.",
             },
         },
         "required": ["query"],
@@ -108,8 +131,52 @@ CONCLUDE_SCHEMA = {
     },
 }
 
+PEERS_SCHEMA = {
+    "name": "honcho_peers",
+    "description": (
+        "List or create peers in the Honcho workspace. "
+        "Peers are identities (users, agents, personas) that Honcho tracks.\n"
+        "Actions: 'list' (default) shows all peers, 'create' creates a new peer."
+    ),
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "action": {
+                "type": "string",
+                "enum": ["list", "create"],
+                "description": "What to do: 'list' (show all peers) or 'create' (make a new peer). Default: list.",
+            },
+            "peer_id": {
+                "type": "string",
+                "description": "ID for the new peer (required for create). Must be alphanumeric with hyphens/underscores.",
+            },
+        },
+        "required": [],
+    },
+}
 
-ALL_TOOL_SCHEMAS = [PROFILE_SCHEMA, SEARCH_SCHEMA, CONTEXT_SCHEMA, CONCLUDE_SCHEMA]
+WORKSPACE_SCHEMA = {
+    "name": "honcho_workspace",
+    "description": (
+        "Manage Honcho workspaces — isolated memory spaces for different contexts.\n"
+        "Actions: 'get' (default) shows current workspace, 'list' shows all, 'create' makes a new one."
+    ),
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "action": {
+                "type": "string",
+                "enum": ["get", "list", "create"],
+                "description": "What to do. Default: get.",
+            },
+            "workspace_id": {
+                "type": "string",
+                "description": "ID for new workspace (required for create). Alphanumeric with hyphens/underscores.",
+            },
+        },
+        "required": [],
+    },
+}
 
 
 # ---------------------------------------------------------------------------
@@ -128,34 +195,6 @@ class HonchoMemoryProvider(MemoryProvider):
         self._prefetch_thread: Optional[threading.Thread] = None
         self._sync_thread: Optional[threading.Thread] = None
 
-        # B1: recall_mode — set during initialize from config
-        self._recall_mode = "hybrid"  # "context", "tools", or "hybrid"
-
-        # B4: First-turn context baking
-        self._first_turn_context: Optional[str] = None
-        self._first_turn_lock = threading.Lock()
-
-        # B5: Cost-awareness turn counting and cadence
-        self._turn_count = 0
-        self._injection_frequency = "every-turn"  # or "first-turn"
-        self._context_cadence = 1   # minimum turns between context API calls
-        self._dialectic_cadence = 1  # minimum turns between dialectic API calls
-        self._reasoning_level_cap: Optional[str] = None  # "minimal", "low", "mid", "high"
-        self._last_context_turn = -999
-        self._last_dialectic_turn = -999
-
-        # B2: peer_memory_mode gating (stub)
-        self._suppress_memory = False
-        self._suppress_user_profile = False
-
-        # Port #1957: lazy session init for tools-only mode
-        self._session_initialized = False
-        self._lazy_init_kwargs: Optional[dict] = None
-        self._lazy_init_session_id: Optional[str] = None
-
-        # Port #4053: cron guard — when True, plugin is fully inactive
-        self._cron_skipped = False
-
     @property
     def name(self) -> str:
         return "honcho"
@@ -165,7 +204,6 @@ class HonchoMemoryProvider(MemoryProvider):
         try:
             from plugins.memory.honcho.client import HonchoClientConfig
             cfg = HonchoClientConfig.from_global_config()
-            # Port #2645: baseUrl-only verification — api_key OR base_url suffices
             return cfg.enabled and bool(cfg.api_key or cfg.base_url)
         except Exception:
             return False
@@ -191,22 +229,8 @@ class HonchoMemoryProvider(MemoryProvider):
         ]
 
     def initialize(self, session_id: str, **kwargs) -> None:
-        """Initialize Honcho session manager.
-
-        Handles: cron guard, recall_mode, session name resolution,
-        peer memory mode, SOUL.md ai_peer sync, memory file migration,
-        and pre-warming context at init.
-        """
+        """Initialize Honcho session manager."""
         try:
-            # ----- Port #4053: cron guard -----
-            agent_context = kwargs.get("agent_context", "")
-            platform = kwargs.get("platform", "cli")
-            if agent_context in ("cron", "flush") or platform == "cron":
-                logger.debug("Honcho skipped: cron/flush context (agent_context=%s, platform=%s)",
-                             agent_context, platform)
-                self._cron_skipped = True
-                return
-
             from plugins.memory.honcho.client import HonchoClientConfig, get_honcho_client
             from plugins.memory.honcho.session import HonchoSessionManager
 
@@ -216,78 +240,20 @@ class HonchoMemoryProvider(MemoryProvider):
                 return
 
             self._config = cfg
+            client = get_honcho_client(cfg)
+            self._manager = HonchoSessionManager(
+                honcho=client,
+                config=cfg,
+                context_tokens=cfg.context_tokens,
+            )
 
-            # ----- B1: recall_mode from config -----
-            self._recall_mode = cfg.recall_mode  # "context", "tools", or "hybrid"
-            logger.debug("Honcho recall_mode: %s", self._recall_mode)
-
-            # ----- B5: cost-awareness config -----
-            try:
-                raw = cfg.raw or {}
-                self._injection_frequency = raw.get("injectionFrequency", "every-turn")
-                self._context_cadence = int(raw.get("contextCadence", 1))
-                self._dialectic_cadence = int(raw.get("dialecticCadence", 1))
-                cap = raw.get("reasoningLevelCap")
-                if cap and cap in ("minimal", "low", "mid", "high"):
-                    self._reasoning_level_cap = cap
-            except Exception as e:
-                logger.debug("Honcho cost-awareness config parse error: %s", e)
-
-            # ----- Port #1969: aiPeer sync from SOUL.md -----
-            try:
-                hermes_home = kwargs.get("hermes_home", "")
-                if hermes_home and not cfg.raw.get("aiPeer"):
-                    soul_path = Path(hermes_home) / "SOUL.md"
-                    if soul_path.exists():
-                        soul_text = soul_path.read_text(encoding="utf-8").strip()
-                        if soul_text:
-                            # Try YAML frontmatter: "name: Foo"
-                            first_line = soul_text.split("\n")[0].strip()
-                            if first_line.startswith("---"):
-                                # Look for name: in frontmatter
-                                for line in soul_text.split("\n")[1:]:
-                                    line = line.strip()
-                                    if line == "---":
-                                        break
-                                    if line.lower().startswith("name:"):
-                                        name_val = line.split(":", 1)[1].strip().strip("\"'")
-                                        if name_val:
-                                            cfg.ai_peer = name_val
-                                            logger.debug("Honcho ai_peer set from SOUL.md: %s", name_val)
-                                        break
-                            elif first_line.startswith("# "):
-                                # Markdown heading: "# AgentName"
-                                name_val = first_line[2:].strip()
-                                if name_val:
-                                    cfg.ai_peer = name_val
-                                    logger.debug("Honcho ai_peer set from SOUL.md heading: %s", name_val)
-            except Exception as e:
-                logger.debug("Honcho SOUL.md ai_peer sync failed: %s", e)
-
-            # ----- B2: peer_memory_mode gating (stub) -----
-            try:
-                ai_mode = cfg.peer_memory_mode(cfg.ai_peer)
-                user_mode = cfg.peer_memory_mode(cfg.peer_name or "user")
-                # "honcho" means Honcho owns memory; suppress built-in
-                self._suppress_memory = (ai_mode == "honcho")
-                self._suppress_user_profile = (user_mode == "honcho")
-                logger.debug("Honcho peer_memory_mode: ai=%s (suppress_memory=%s), user=%s (suppress_user_profile=%s)",
-                             ai_mode, self._suppress_memory, user_mode, self._suppress_user_profile)
-            except Exception as e:
-                logger.debug("Honcho peer_memory_mode check failed: %s", e)
-
-            # ----- Port #1957: lazy session init for tools-only mode -----
-            if self._recall_mode == "tools":
-                # Defer actual session creation until first tool call
-                self._lazy_init_kwargs = kwargs
-                self._lazy_init_session_id = session_id
-                # Still need a client reference for _ensure_session
-                self._config = cfg
-                logger.debug("Honcho tools-only mode — deferring session init until first tool call")
-                return
-
-            # ----- Eager init (context or hybrid mode) -----
-            self._do_session_init(cfg, session_id, **kwargs)
+            # Build session key from kwargs or session_id
+            platform = kwargs.get("platform", "cli")
+            user_id = kwargs.get("user_id", "")
+            if user_id:
+                self._session_key = f"{platform}:{user_id}"
+            else:
+                self._session_key = session_id
 
         except ImportError:
             logger.debug("honcho-ai package not installed — plugin inactive")
@@ -295,180 +261,19 @@ class HonchoMemoryProvider(MemoryProvider):
             logger.warning("Honcho init failed: %s", e)
             self._manager = None
 
-    def _do_session_init(self, cfg, session_id: str, **kwargs) -> None:
-        """Shared session initialization logic for both eager and lazy paths."""
-        from plugins.memory.honcho.client import get_honcho_client
-        from plugins.memory.honcho.session import HonchoSessionManager
-
-        client = get_honcho_client(cfg)
-        self._manager = HonchoSessionManager(
-            honcho=client,
-            config=cfg,
-            context_tokens=cfg.context_tokens,
-        )
-
-        # ----- B3: resolve_session_name -----
-        session_title = kwargs.get("session_title")
-        self._session_key = (
-            cfg.resolve_session_name(session_title=session_title, session_id=session_id)
-            or session_id
-            or "hermes-default"
-        )
-        logger.debug("Honcho session key resolved: %s", self._session_key)
-
-        # Create session eagerly
-        session = self._manager.get_or_create(self._session_key)
-        self._session_initialized = True
-
-        # ----- B6: Memory file migration (one-time, for new sessions) -----
-        try:
-            if not session.messages:
-                from hermes_constants import get_hermes_home
-                mem_dir = str(get_hermes_home() / "memories")
-                self._manager.migrate_memory_files(self._session_key, mem_dir)
-                logger.debug("Honcho memory file migration attempted for new session: %s", self._session_key)
-        except Exception as e:
-            logger.debug("Honcho memory file migration skipped: %s", e)
-
-        # ----- B7: Pre-warming context at init -----
-        if self._recall_mode in ("context", "hybrid"):
-            try:
-                self._manager.prefetch_context(self._session_key)
-                self._manager.prefetch_dialectic(self._session_key, "What should I know about this user?")
-                logger.debug("Honcho pre-warm threads started for session: %s", self._session_key)
-            except Exception as e:
-                logger.debug("Honcho pre-warm failed: %s", e)
-
-    def _ensure_session(self) -> bool:
-        """Lazily initialize the Honcho session (for tools-only mode).
-
-        Returns True if the manager is ready, False otherwise.
-        """
-        if self._manager and self._session_initialized:
-            return True
-        if self._cron_skipped:
-            return False
-        if not self._config or not self._lazy_init_kwargs:
-            return False
-
-        try:
-            self._do_session_init(
-                self._config,
-                self._lazy_init_session_id or "hermes-default",
-                **self._lazy_init_kwargs,
-            )
-            # Clear lazy refs
-            self._lazy_init_kwargs = None
-            self._lazy_init_session_id = None
-            return self._manager is not None
-        except Exception as e:
-            logger.warning("Honcho lazy session init failed: %s", e)
-            return False
-
-    def _format_first_turn_context(self, ctx: dict) -> str:
-        """Format the prefetch context dict into a readable system prompt block."""
-        parts = []
-
-        rep = ctx.get("representation", "")
-        if rep:
-            parts.append(f"## User Representation\n{rep}")
-
-        card = ctx.get("card", "")
-        if card:
-            parts.append(f"## User Peer Card\n{card}")
-
-        ai_rep = ctx.get("ai_representation", "")
-        if ai_rep:
-            parts.append(f"## AI Self-Representation\n{ai_rep}")
-
-        ai_card = ctx.get("ai_card", "")
-        if ai_card:
-            parts.append(f"## AI Identity Card\n{ai_card}")
-
-        if not parts:
-            return ""
-        return "\n\n".join(parts)
-
     def system_prompt_block(self) -> str:
-        """Return system prompt text, adapted by recall_mode.
-
-        B4: On the FIRST call, fetch and bake the full Honcho context
-        (user representation, peer card, AI representation, continuity synthesis).
-        Subsequent calls return the cached block for prompt caching stability.
-        """
-        if self._cron_skipped:
-            return ""
         if not self._manager or not self._session_key:
-            # tools-only mode without session yet still returns a minimal block
-            if self._recall_mode == "tools" and self._config:
-                return (
-                    "# Honcho Memory\n"
-                    "Active (tools-only mode). Use honcho_profile, honcho_search, "
-                    "honcho_context, and honcho_conclude tools to access user memory."
-                )
             return ""
+        return (
+            "# Honcho Memory\n"
+            "Active. AI-native cross-session user modeling.\n"
+            "Use honcho_profile for a quick factual snapshot, "
+            "honcho_search for raw excerpts, honcho_context for synthesized answers, "
+            "honcho_conclude to save facts about the user."
+        )
 
-        # ----- B4: First-turn context baking -----
-        first_turn_block = ""
-        if self._recall_mode in ("context", "hybrid"):
-            with self._first_turn_lock:
-                if self._first_turn_context is None:
-                    # First call — fetch and cache
-                    try:
-                        ctx = self._manager.get_prefetch_context(self._session_key)
-                        self._first_turn_context = self._format_first_turn_context(ctx) if ctx else ""
-                    except Exception as e:
-                        logger.debug("Honcho first-turn context fetch failed: %s", e)
-                        self._first_turn_context = ""
-                first_turn_block = self._first_turn_context
-
-        # ----- B1: adapt text based on recall_mode -----
-        if self._recall_mode == "context":
-            header = (
-                "# Honcho Memory\n"
-                "Active (context-injection mode). Relevant user context is automatically "
-                "injected before each turn. No memory tools are available — context is "
-                "managed automatically."
-            )
-        elif self._recall_mode == "tools":
-            header = (
-                "# Honcho Memory\n"
-                "Active (tools-only mode). Use honcho_profile for a quick factual snapshot, "
-                "honcho_search for raw excerpts, honcho_context for synthesized answers, "
-                "honcho_conclude to save facts about the user. "
-                "No automatic context injection — you must use tools to access memory."
-            )
-        else:  # hybrid
-            header = (
-                "# Honcho Memory\n"
-                "Active (hybrid mode). Relevant context is auto-injected AND memory tools are available. "
-                "Use honcho_profile for a quick factual snapshot, "
-                "honcho_search for raw excerpts, honcho_context for synthesized answers, "
-                "honcho_conclude to save facts about the user."
-            )
-
-        if first_turn_block:
-            return f"{header}\n\n{first_turn_block}"
-        return header
-
-    def prefetch(self, query: str, *, session_id: str = "") -> str:
-        """Return prefetched dialectic context from background thread.
-
-        B1: Returns empty when recall_mode is "tools" (no injection).
-        B5: Respects injection_frequency — "first-turn" returns cached/empty after turn 0.
-        Port #3265: Truncates to context_tokens budget.
-        """
-        if self._cron_skipped:
-            return ""
-
-        # B1: tools-only mode — no auto-injection
-        if self._recall_mode == "tools":
-            return ""
-
-        # B5: injection_frequency — if "first-turn" and past first turn, return empty
-        if self._injection_frequency == "first-turn" and self._turn_count > 0:
-            return ""
-
+    def prefetch(self, query: str) -> str:
+        """Return prefetched dialectic context from background thread."""
         if self._prefetch_thread and self._prefetch_thread.is_alive():
             self._prefetch_thread.join(timeout=3.0)
         with self._prefetch_lock:
@@ -476,48 +281,12 @@ class HonchoMemoryProvider(MemoryProvider):
             self._prefetch_result = ""
         if not result:
             return ""
-
-        # ----- Port #3265: token budget enforcement -----
-        result = self._truncate_to_budget(result)
-
         return f"## Honcho Context\n{result}"
 
-    def _truncate_to_budget(self, text: str) -> str:
-        """Truncate text to fit within context_tokens budget if set."""
-        if not self._config or not self._config.context_tokens:
-            return text
-        budget_chars = self._config.context_tokens * 4  # conservative char estimate
-        if len(text) <= budget_chars:
-            return text
-        # Truncate at word boundary
-        truncated = text[:budget_chars]
-        last_space = truncated.rfind(" ")
-        if last_space > budget_chars * 0.8:
-            truncated = truncated[:last_space]
-        return truncated + " …"
-
-    def queue_prefetch(self, query: str, *, session_id: str = "") -> None:
-        """Fire a background dialectic query for the upcoming turn.
-
-        B5: Checks cadence before firing background threads.
-        """
-        if self._cron_skipped:
-            return
+    def queue_prefetch(self, query: str) -> None:
+        """Fire a background dialectic query for the upcoming turn."""
         if not self._manager or not self._session_key or not query:
             return
-
-        # B1: tools-only mode — no prefetch
-        if self._recall_mode == "tools":
-            return
-
-        # B5: cadence check — skip if too soon since last dialectic call
-        if self._dialectic_cadence > 1:
-            if (self._turn_count - self._last_dialectic_turn) < self._dialectic_cadence:
-                logger.debug("Honcho dialectic prefetch skipped: cadence %d, turns since last: %d",
-                             self._dialectic_cadence, self._turn_count - self._last_dialectic_turn)
-                return
-
-        self._last_dialectic_turn = self._turn_count
 
         def _run():
             try:
@@ -535,28 +304,14 @@ class HonchoMemoryProvider(MemoryProvider):
         )
         self._prefetch_thread.start()
 
-        # Also fire context prefetch if cadence allows
-        if self._context_cadence <= 1 or (self._turn_count - self._last_context_turn) >= self._context_cadence:
-            self._last_context_turn = self._turn_count
-            try:
-                self._manager.prefetch_context(self._session_key, query)
-            except Exception as e:
-                logger.debug("Honcho context prefetch failed: %s", e)
-
-    def on_turn_start(self, turn_number: int, message: str, **kwargs) -> None:
-        """Track turn count for cadence and injection_frequency logic."""
-        self._turn_count = turn_number
-
-    def sync_turn(self, user_content: str, assistant_content: str, *, session_id: str = "") -> None:
+    def sync_turn(self, user_content: str, assistant_content: str) -> None:
         """Record the conversation turn in Honcho (non-blocking)."""
-        if self._cron_skipped:
-            return
         if not self._manager or not self._session_key:
             return
 
         def _sync():
             try:
-                session = self._manager.get_or_create(self._session_key)
+                session = self._manager.get_or_create_session(self._session_key)
                 session.add_message("user", user_content[:4000])
                 session.add_message("assistant", assistant_content[:4000])
                 # Flush to Honcho API
@@ -575,8 +330,6 @@ class HonchoMemoryProvider(MemoryProvider):
         """Mirror built-in user profile writes as Honcho conclusions."""
         if action != "add" or target != "user" or not content:
             return
-        if self._cron_skipped:
-            return
         if not self._manager or not self._session_key:
             return
 
@@ -591,8 +344,6 @@ class HonchoMemoryProvider(MemoryProvider):
 
     def on_session_end(self, messages: List[Dict[str, Any]]) -> None:
         """Flush all pending messages to Honcho on session end."""
-        if self._cron_skipped:
-            return
         if not self._manager:
             return
         # Wait for pending sync
@@ -604,35 +355,64 @@ class HonchoMemoryProvider(MemoryProvider):
             logger.debug("Honcho session-end flush failed: %s", e)
 
     def get_tool_schemas(self) -> List[Dict[str, Any]]:
-        """Return tool schemas, respecting recall_mode.
+        return [PROFILE_SCHEMA, SEARCH_SCHEMA, CONTEXT_SCHEMA, CONCLUDE_SCHEMA, PEERS_SCHEMA, WORKSPACE_SCHEMA]
 
-        B1: context-only mode hides all tools.
+    def _resolve_peer(self, peer_arg: str | None):
+        """Resolve a peer argument to a Honcho Peer object.
+
+        'user' or None -> user peer, 'ai' -> assistant peer,
+        anything else -> get-or-create by ID.
         """
-        if self._cron_skipped:
-            return []
-        if self._recall_mode == "context":
-            return []
-        return list(ALL_TOOL_SCHEMAS)
+        if self._session_key not in self._manager._cache:
+            self._manager.get_or_create(self._session_key)
+        session = self._manager._cache[self._session_key]
+
+        if not peer_arg or peer_arg == "user":
+            return self._manager._get_or_create_peer(session.user_peer_id)
+        elif peer_arg == "ai":
+            return self._manager._get_or_create_peer(session.assistant_peer_id)
+        else:
+            sanitized = self._manager._sanitize_id(peer_arg)
+            return self._manager._get_or_create_peer(sanitized)
 
     def handle_tool_call(self, tool_name: str, args: dict, **kwargs) -> str:
-        """Handle a Honcho tool call, with lazy session init for tools-only mode."""
-        if self._cron_skipped:
-            return json.dumps({"error": "Honcho is not active (cron context)."})
-
-        # Port #1957: ensure session is initialized for tools-only mode
-        if not self._session_initialized:
-            if not self._ensure_session():
-                return json.dumps({"error": "Honcho session could not be initialized."})
-
         if not self._manager or not self._session_key:
             return json.dumps({"error": "Honcho is not active for this session."})
 
         try:
             if tool_name == "honcho_profile":
-                card = self._manager.get_peer_card(self._session_key)
-                if not card:
-                    return json.dumps({"result": "No profile facts available yet."})
-                return json.dumps({"result": card})
+                action = args.get("action", "get")
+                peer = self._resolve_peer(args.get("peer"))
+                target = args.get("target") or None
+
+                if action == "get":
+                    card = peer.get_card(target=target)
+                    if not card:
+                        label = f"{peer.id} about {target}" if target else peer.id
+                        return json.dumps({"result": "No profile facts available yet.", "peer": label})
+                    return json.dumps({"result": card, "peer": peer.id, "target": target})
+
+                elif action == "set":
+                    facts = args.get("facts", [])
+                    if not facts:
+                        return json.dumps({"error": "Missing 'facts' list for set action."})
+                    if len(facts) > 40:
+                        return json.dumps({"error": f"Peer cards have a 40-fact limit. Got {len(facts)}."})
+                    result = peer.set_card(facts, target=target)
+                    return json.dumps({"result": result or facts, "peer": peer.id, "target": target, "action": "set"})
+
+                elif action == "add":
+                    facts = args.get("facts", [])
+                    if not facts:
+                        return json.dumps({"error": "Missing 'facts' list for add action."})
+                    existing = peer.get_card(target=target) or []
+                    merged = existing + facts
+                    if len(merged) > 40:
+                        return json.dumps({"error": f"Would exceed 40-fact limit ({len(existing)} existing + {len(facts)} new = {len(merged)}). Use 'set' to replace."})
+                    result = peer.set_card(merged, target=target)
+                    return json.dumps({"result": result or merged, "peer": peer.id, "target": target, "action": "add", "added": len(facts)})
+
+                return json.dumps({"error": f"Unknown action: {action}"})
 
             elif tool_name == "honcho_search":
                 query = args.get("query", "")
@@ -650,11 +430,10 @@ class HonchoMemoryProvider(MemoryProvider):
                 query = args.get("query", "")
                 if not query:
                     return json.dumps({"error": "Missing required parameter: query"})
-                peer = args.get("peer", "user")
-                result = self._manager.dialectic_query(
-                    self._session_key, query, peer=peer
-                )
-                return json.dumps({"result": result or "No result from Honcho."})
+                peer_arg = args.get("peer", "user")
+                peer = self._resolve_peer(peer_arg)
+                result = peer.chat(query) or ""
+                return json.dumps({"result": result or "No result from Honcho.", "peer": peer.id})
 
             elif tool_name == "honcho_conclude":
                 conclusion = args.get("conclusion", "")
@@ -664,6 +443,66 @@ class HonchoMemoryProvider(MemoryProvider):
                 if ok:
                     return json.dumps({"result": f"Conclusion saved: {conclusion}"})
                 return json.dumps({"error": "Failed to save conclusion."})
+
+            elif tool_name == "honcho_peers":
+                action = args.get("action", "list")
+
+                if action == "list":
+                    page = self._manager.honcho.peers()
+                    peers = [{"id": p.id, "created_at": str(p.created_at)} for p in page.items]
+                    return json.dumps({"peers": peers, "total": page.total})
+
+                elif action == "create":
+                    peer_id = args.get("peer_id", "")
+                    if not peer_id:
+                        return json.dumps({"error": "Missing 'peer_id' for create action."})
+                    sanitized = self._manager._sanitize_id(peer_id)
+                    peer = self._manager.honcho.peer(sanitized)
+                    return json.dumps({"result": f"Peer '{peer.id}' created.", "peer": peer.id})
+
+                return json.dumps({"error": f"Unknown action: {action}"})
+
+            elif tool_name == "honcho_workspace":
+                action = args.get("action", "get")
+
+                if action == "get":
+                    return json.dumps({
+                        "workspace": self._config.workspace_id,
+                        "host": self._config.host,
+                        "peer_name": self._config.peer_name,
+                        "ai_peer": self._config.ai_peer,
+                    })
+
+                elif action == "list":
+                    try:
+                        page = self._manager.honcho.workspaces()
+                        workspaces = [{"id": w.id, "created_at": str(w.created_at)} for w in page.items]
+                        return json.dumps({"workspaces": workspaces, "total": page.total})
+                    except AttributeError:
+                        import httpx
+                        base = self._config.base_url or "http://localhost:8000"
+                        resp = httpx.post(f"{base}/v3/workspaces/list", json={}, timeout=10)
+                        resp.raise_for_status()
+                        data = resp.json()
+                        workspaces = [{"id": w["id"], "created_at": w.get("created_at", "")} for w in data.get("items", [])]
+                        return json.dumps({"workspaces": workspaces, "total": data.get("total", len(workspaces))})
+
+                elif action == "create":
+                    workspace_id = args.get("workspace_id", "")
+                    if not workspace_id:
+                        return json.dumps({"error": "Missing 'workspace_id' for create action."})
+                    try:
+                        ws = self._manager.honcho.workspace(workspace_id)
+                        return json.dumps({"result": f"Workspace '{ws.id}' ready.", "workspace": ws.id})
+                    except (AttributeError, Exception):
+                        import httpx
+                        base = self._config.base_url or "http://localhost:8000"
+                        resp = httpx.post(f"{base}/v3/workspaces", json={"id": workspace_id}, timeout=10)
+                        resp.raise_for_status()
+                        data = resp.json()
+                        return json.dumps({"result": f"Workspace '{data.get('id', workspace_id)}' ready.", "workspace": data.get("id", workspace_id)})
+
+                return json.dumps({"error": f"Unknown action: {action}"})
 
             return json.dumps({"error": f"Unknown tool: {tool_name}"})
 

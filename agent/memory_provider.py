@@ -1,13 +1,11 @@
 """Abstract base class for pluggable memory providers.
 
-Memory providers give the agent persistent recall across sessions. One
-external provider is active at a time alongside the always-on built-in
-memory (MEMORY.md / USER.md). The MemoryManager enforces this limit.
+Memory providers give the agent persistent recall across sessions. Multiple
+providers can be active simultaneously — the MemoryManager orchestrates them.
 
-Built-in memory is always active as the first provider and cannot be removed.
+Built-in memory (MEMORY.md / USER.md) is always active as the first provider.
 External providers (Honcho, Hindsight, Mem0, etc.) are additive — they never
-disable the built-in store. Only one external provider runs at a time to
-prevent tool schema bloat and conflicting memory backends.
+disable the built-in store.
 
 Registration:
   1. Built-in: BuiltinMemoryProvider — always present, not removable.
@@ -23,11 +21,10 @@ Lifecycle (called by MemoryManager, wired in run_agent.py):
   shutdown()             — clean exit
 
 Optional hooks (override to opt in):
-  on_turn_start(turn, message, **kwargs) — per-turn tick with runtime context
-  on_session_end(messages)               — end-of-session extraction
-  on_pre_compress(messages) -> str       — extract before context compression
+  on_turn_start(turn, message)     — per-turn tick (scope cooling, etc.)
+  on_session_end(messages)         — end-of-session extraction
+  on_pre_compress(messages)        — extract before context compression
   on_memory_write(action, target, content) — mirror built-in memory writes
-  on_delegation(task, result, **kwargs)  — parent-side observation of subagent work
 """
 
 from __future__ import annotations
@@ -67,17 +64,8 @@ class MemoryProvider(ABC):
         kwargs always include:
           - hermes_home (str): The active HERMES_HOME directory path. Use this
             for profile-scoped storage instead of hardcoding ``~/.hermes``.
-          - platform (str): "cli", "telegram", "discord", "cron", etc.
 
-        kwargs may also include:
-          - agent_context (str): "primary", "subagent", "cron", or "flush".
-            Providers should skip writes for non-primary contexts (cron system
-            prompts would corrupt user representations).
-          - agent_identity (str): Profile name (e.g. "coder"). Use for
-            per-profile provider identity scoping.
-          - agent_workspace (str): Shared workspace name (e.g. "hermes").
-          - parent_session_id (str): For subagents, the parent's session_id.
-          - user_id (str): Platform user identifier (gateway sessions).
+        kwargs may also include: platform, model, user_id, and other session context.
         """
 
     def system_prompt_block(self) -> str:
@@ -89,21 +77,17 @@ class MemoryProvider(ABC):
         """
         return ""
 
-    def prefetch(self, query: str, *, session_id: str = "") -> str:
+    def prefetch(self, query: str) -> str:
         """Recall relevant context for the upcoming turn.
 
         Called before each API call. Return formatted text to inject as
         context, or empty string if nothing relevant. Implementations
         should be fast — use background threads for the actual recall
         and return cached results here.
-
-        session_id is provided for providers serving concurrent sessions
-        (gateway group chats, cached agents). Providers that don't need
-        per-session scoping can ignore it.
         """
         return ""
 
-    def queue_prefetch(self, query: str, *, session_id: str = "") -> None:
+    def queue_prefetch(self, query: str) -> None:
         """Queue a background recall for the NEXT turn.
 
         Called after each turn completes. The result will be consumed
@@ -111,7 +95,7 @@ class MemoryProvider(ABC):
         that do background prefetching should override this.
         """
 
-    def sync_turn(self, user_content: str, assistant_content: str, *, session_id: str = "") -> None:
+    def sync_turn(self, user_content: str, assistant_content: str) -> None:
         """Persist a completed turn to the backend.
 
         Called after each turn. Should be non-blocking — queue for
@@ -141,13 +125,10 @@ class MemoryProvider(ABC):
 
     # -- Optional hooks (override to opt in) ---------------------------------
 
-    def on_turn_start(self, turn_number: int, message: str, **kwargs) -> None:
+    def on_turn_start(self, turn_number: int, message: str) -> None:
         """Called at the start of each turn with the user message.
 
         Use for turn-counting, scope management, periodic maintenance.
-
-        kwargs may include: remaining_tokens, model, platform, tool_count.
-        Providers use what they need; extras are ignored.
         """
 
     def on_session_end(self, messages: List[Dict[str, Any]]) -> None:
@@ -155,34 +136,13 @@ class MemoryProvider(ABC):
 
         Use for end-of-session fact extraction, summarization, etc.
         messages is the full conversation history.
-
-        NOT called after every turn — only at actual session boundaries
-        (CLI exit, /reset, gateway session expiry).
         """
 
-    def on_pre_compress(self, messages: List[Dict[str, Any]]) -> str:
+    def on_pre_compress(self, messages: List[Dict[str, Any]]) -> None:
         """Called before context compression discards old messages.
 
         Use to extract insights from messages about to be compressed.
         messages is the list that will be summarized/discarded.
-
-        Return text to include in the compression summary prompt so the
-        compressor preserves provider-extracted insights. Return empty
-        string for no contribution (backwards-compatible default).
-        """
-        return ""
-
-    def on_delegation(self, task: str, result: str, *,
-                      child_session_id: str = "", **kwargs) -> None:
-        """Called on the PARENT agent when a subagent completes.
-
-        The parent's memory provider gets the task+result pair as an
-        observation of what was delegated and what came back. The subagent
-        itself has no provider session (skip_memory=True).
-
-        task: the delegation prompt
-        result: the subagent's final response
-        child_session_id: the subagent's session_id
         """
 
     def get_config_schema(self) -> List[Dict[str, Any]]:

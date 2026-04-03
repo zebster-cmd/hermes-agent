@@ -47,14 +47,14 @@ class FakeMemoryProvider(MemoryProvider):
     def system_prompt_block(self) -> str:
         return self._prompt_block
 
-    def prefetch(self, query, *, session_id=""):
+    def prefetch(self, query):
         self.prefetch_queries.append(query)
         return self._prefetch_result
 
-    def queue_prefetch(self, query, *, session_id=""):
+    def queue_prefetch(self, query):
         self.queued_prefetches.append(query)
 
-    def sync_turn(self, user_content, assistant_content, *, session_id=""):
+    def sync_turn(self, user_content, assistant_content):
         self.synced_turns.append((user_content, assistant_content))
 
     def get_tool_schemas(self):
@@ -145,17 +145,14 @@ class TestMemoryManager:
         mgr.add_provider(p2)
         assert mgr.provider_names == ["builtin", "external"]
 
-    def test_second_external_rejected(self):
-        """Only one non-builtin provider is allowed."""
+    def test_multiple_external_providers_accepted(self):
+        """Multiple external providers can coexist."""
         mgr = MemoryManager()
-        builtin = FakeMemoryProvider("builtin")
-        ext1 = FakeMemoryProvider("mem0")
-        ext2 = FakeMemoryProvider("hindsight")
-        mgr.add_provider(builtin)
-        mgr.add_provider(ext1)
-        mgr.add_provider(ext2)  # should be rejected
-        assert mgr.provider_names == ["builtin", "mem0"]
+        mgr.add_provider(FakeMemoryProvider("honcho"))
+        mgr.add_provider(FakeMemoryProvider("openviking"))
         assert len(mgr.providers) == 2
+        assert "honcho" in mgr.provider_names
+        assert "openviking" in mgr.provider_names
 
     def test_system_prompt_merges_blocks(self):
         mgr = MemoryManager()

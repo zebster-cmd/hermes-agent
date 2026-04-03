@@ -215,7 +215,7 @@ class ByteRoverMemoryProvider(MemoryProvider):
             "important facts, brv_status to check state."
         )
 
-    def prefetch(self, query: str, *, session_id: str = "") -> str:
+    def prefetch(self, query: str) -> str:
         if self._prefetch_thread and self._prefetch_thread.is_alive():
             self._prefetch_thread.join(timeout=3.0)
         with self._prefetch_lock:
@@ -225,7 +225,7 @@ class ByteRoverMemoryProvider(MemoryProvider):
             return ""
         return f"## ByteRover Context\n{result}"
 
-    def queue_prefetch(self, query: str, *, session_id: str = "") -> None:
+    def queue_prefetch(self, query: str) -> None:
         if not query or len(query.strip()) < _MIN_QUERY_LEN:
             return
 
@@ -248,7 +248,7 @@ class ByteRoverMemoryProvider(MemoryProvider):
         )
         self._prefetch_thread.start()
 
-    def sync_turn(self, user_content: str, assistant_content: str, *, session_id: str = "") -> None:
+    def sync_turn(self, user_content: str, assistant_content: str) -> None:
         """Curate the conversation turn in background (non-blocking)."""
         self._turn_count += 1
 
@@ -293,10 +293,10 @@ class ByteRoverMemoryProvider(MemoryProvider):
         t = threading.Thread(target=_write, daemon=True, name="brv-memwrite")
         t.start()
 
-    def on_pre_compress(self, messages: List[Dict[str, Any]]) -> str:
+    def on_pre_compress(self, messages: List[Dict[str, Any]]) -> None:
         """Extract insights before context compression discards turns."""
         if not messages:
-            return ""
+            return
 
         # Build a summary of messages about to be compressed
         parts = []
@@ -307,7 +307,7 @@ class ByteRoverMemoryProvider(MemoryProvider):
                 parts.append(f"{role}: {content[:500]}")
 
         if not parts:
-            return ""
+            return
 
         combined = "\n".join(parts)
 
@@ -323,7 +323,6 @@ class ByteRoverMemoryProvider(MemoryProvider):
 
         t = threading.Thread(target=_flush, daemon=True, name="brv-flush")
         t.start()
-        return ""
 
     def get_tool_schemas(self) -> List[Dict[str, Any]]:
         return [QUERY_SCHEMA, CURATE_SCHEMA, STATUS_SCHEMA]

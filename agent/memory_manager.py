@@ -1,19 +1,18 @@
-"""MemoryManager — orchestrates the built-in memory provider plus at most
-ONE external plugin memory provider.
+"""MemoryManager — orchestrates the built-in memory provider plus one or
+more external plugin memory providers.
 
 Single integration point in run_agent.py. Replaces scattered per-backend
 code with one manager that delegates to registered providers.
 
 The BuiltinMemoryProvider is always registered first and cannot be removed.
-Only ONE external (non-builtin) provider is allowed at a time — attempting
-to register a second external provider is rejected with a warning.  This
-prevents tool schema bloat and conflicting memory backends.
+Multiple external providers are supported — configure them as a
+comma-separated list in ``memory.provider`` (e.g. ``honcho,openviking``).
 
 Usage in run_agent.py:
     self._memory_manager = MemoryManager()
     self._memory_manager.add_provider(BuiltinMemoryProvider(...))
-    # Only ONE of these:
-    self._memory_manager.add_provider(plugin_provider)
+    self._memory_manager.add_provider(honcho_provider)
+    self._memory_manager.add_provider(openviking_provider)
 
     # System prompt
     prompt_parts.append(self._memory_manager.build_system_prompt())
@@ -38,10 +37,10 @@ logger = logging.getLogger(__name__)
 
 
 class MemoryManager:
-    """Orchestrates the built-in provider plus at most one external provider.
+    """Orchestrates the built-in provider plus one or more external providers.
 
-    The builtin provider is always first. Only one non-builtin (external)
-    provider is allowed.  Failures in one provider never block the other.
+    The builtin provider is always first. Multiple external providers are
+    supported. Failures in one provider never block the others.
     """
 
     def __init__(self) -> None:
@@ -55,24 +54,10 @@ class MemoryManager:
         """Register a memory provider.
 
         Built-in provider (name ``"builtin"``) is always accepted.
-        Only **one** external (non-builtin) provider is allowed — a second
-        attempt is rejected with a warning.
+        Multiple external providers are supported — configure them as a
+        comma-separated list in ``memory.provider`` (e.g. ``honcho,openviking``).
         """
-        is_builtin = provider.name == "builtin"
-
-        if not is_builtin:
-            if self._has_external:
-                existing = next(
-                    (p.name for p in self._providers if p.name != "builtin"), "unknown"
-                )
-                logger.warning(
-                    "Rejected memory provider '%s' — external provider '%s' is "
-                    "already registered. Only one external memory provider is "
-                    "allowed at a time. Configure which one via memory.provider "
-                    "in config.yaml.",
-                    provider.name, existing,
-                )
-                return
+        if provider.name != "builtin":
             self._has_external = True
 
         self._providers.append(provider)
@@ -137,7 +122,7 @@ class MemoryManager:
 
     # -- Prefetch / recall ---------------------------------------------------
 
-    def prefetch_all(self, query: str, *, session_id: str = "") -> str:
+    def prefetch_all(self, query: str) -> str:
         """Collect prefetch context from all providers.
 
         Returns merged context text labeled by provider. Empty providers
@@ -146,7 +131,7 @@ class MemoryManager:
         parts = []
         for provider in self._providers:
             try:
-                result = provider.prefetch(query, session_id=session_id)
+                result = provider.prefetch(query)
                 if result and result.strip():
                     parts.append(result)
             except Exception as e:
@@ -156,11 +141,11 @@ class MemoryManager:
                 )
         return "\n\n".join(parts)
 
-    def queue_prefetch_all(self, query: str, *, session_id: str = "") -> None:
+    def queue_prefetch_all(self, query: str) -> None:
         """Queue background prefetch on all providers for the next turn."""
         for provider in self._providers:
             try:
-                provider.queue_prefetch(query, session_id=session_id)
+                provider.queue_prefetch(query)
             except Exception as e:
                 logger.debug(
                     "Memory provider '%s' queue_prefetch failed (non-fatal): %s",
@@ -169,11 +154,11 @@ class MemoryManager:
 
     # -- Sync ----------------------------------------------------------------
 
-    def sync_all(self, user_content: str, assistant_content: str, *, session_id: str = "") -> None:
+    def sync_all(self, user_content: str, assistant_content: str) -> None:
         """Sync a completed turn to all providers."""
         for provider in self._providers:
             try:
-                provider.sync_turn(user_content, assistant_content, session_id=session_id)
+                provider.sync_turn(user_content, assistant_content)
             except Exception as e:
                 logger.warning(
                     "Memory provider '%s' sync_turn failed: %s",
@@ -230,14 +215,11 @@ class MemoryManager:
 
     # -- Lifecycle hooks -----------------------------------------------------
 
-    def on_turn_start(self, turn_number: int, message: str, **kwargs) -> None:
-        """Notify all providers of a new turn.
-
-        kwargs may include: remaining_tokens, model, platform, tool_count.
-        """
+    def on_turn_start(self, turn_number: int, message: str) -> None:
+        """Notify all providers of a new turn."""
         for provider in self._providers:
             try:
-                provider.on_turn_start(turn_number, message, **kwargs)
+                provider.on_turn_start(turn_number, message)
             except Exception as e:
                 logger.debug(
                     "Memory provider '%s' on_turn_start failed: %s",
@@ -255,24 +237,16 @@ class MemoryManager:
                     provider.name, e,
                 )
 
-    def on_pre_compress(self, messages: List[Dict[str, Any]]) -> str:
-        """Notify all providers before context compression.
-
-        Returns combined text from providers to include in the compression
-        summary prompt. Empty string if no provider contributes.
-        """
-        parts = []
+    def on_pre_compress(self, messages: List[Dict[str, Any]]) -> None:
+        """Notify all providers before context compression."""
         for provider in self._providers:
             try:
-                result = provider.on_pre_compress(messages)
-                if result and result.strip():
-                    parts.append(result)
+                provider.on_pre_compress(messages)
             except Exception as e:
                 logger.debug(
                     "Memory provider '%s' on_pre_compress failed: %s",
                     provider.name, e,
                 )
-        return "\n\n".join(parts)
 
     def on_memory_write(self, action: str, target: str, content: str) -> None:
         """Notify external providers when the built-in memory tool writes.
@@ -287,20 +261,6 @@ class MemoryManager:
             except Exception as e:
                 logger.debug(
                     "Memory provider '%s' on_memory_write failed: %s",
-                    provider.name, e,
-                )
-
-    def on_delegation(self, task: str, result: str, *,
-                      child_session_id: str = "", **kwargs) -> None:
-        """Notify all providers that a subagent completed."""
-        for provider in self._providers:
-            try:
-                provider.on_delegation(
-                    task, result, child_session_id=child_session_id, **kwargs
-                )
-            except Exception as e:
-                logger.debug(
-                    "Memory provider '%s' on_delegation failed: %s",
                     provider.name, e,
                 )
 
@@ -331,5 +291,20 @@ class MemoryManager:
             except Exception as e:
                 logger.warning(
                     "Memory provider '%s' initialize failed: %s",
+                    provider.name, e,
+                )
+
+        # Re-index tool->provider map now that providers are initialized.
+        # Some providers return empty schemas before initialize() runs.
+        self._tool_to_provider.clear()
+        for provider in self._providers:
+            try:
+                for schema in provider.get_tool_schemas():
+                    tool_name = schema.get("name", "")
+                    if tool_name and tool_name not in self._tool_to_provider:
+                        self._tool_to_provider[tool_name] = provider
+            except Exception as e:
+                logger.debug(
+                    "Memory provider '%s' tool re-index failed: %s",
                     provider.name, e,
                 )

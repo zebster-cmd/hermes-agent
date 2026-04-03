@@ -61,7 +61,7 @@ class SQLiteMemoryProvider(MemoryProvider):
             f"Use sqlite_recall to search, sqlite_retain to store."
         )
 
-    def prefetch(self, query: str, *, session_id: str = "") -> str:
+    def prefetch(self, query: str) -> str:
         if not self._conn or not query:
             return ""
         # FTS5 search
@@ -77,7 +77,7 @@ class SQLiteMemoryProvider(MemoryProvider):
         except sqlite3.OperationalError:
             return ""
 
-    def sync_turn(self, user_content: str, assistant_content: str, *, session_id: str = "") -> None:
+    def sync_turn(self, user_content: str, assistant_content: str) -> None:
         if not self._conn:
             return
         combined = f"User: {user_content}\nAssistant: {assistant_content}"

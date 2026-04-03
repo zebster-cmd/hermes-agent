@@ -171,7 +171,7 @@ class RetainDBMemoryProvider(MemoryProvider):
             "retaindb_profile for a user overview, retaindb_context for task-relevant context."
         )
 
-    def prefetch(self, query: str, *, session_id: str = "") -> str:
+    def prefetch(self, query: str) -> str:
         if self._prefetch_thread and self._prefetch_thread.is_alive():
             self._prefetch_thread.join(timeout=3.0)
         with self._prefetch_lock:
@@ -181,7 +181,7 @@ class RetainDBMemoryProvider(MemoryProvider):
             return ""
         return f"## RetainDB Memory\n{result}"
 
-    def queue_prefetch(self, query: str, *, session_id: str = "") -> None:
+    def queue_prefetch(self, query: str) -> None:
         def _run():
             try:
                 data = self._api("POST", "/v1/recall", json={
@@ -201,7 +201,7 @@ class RetainDBMemoryProvider(MemoryProvider):
         self._prefetch_thread = threading.Thread(target=_run, daemon=True, name="retaindb-prefetch")
         self._prefetch_thread.start()
 
-    def sync_turn(self, user_content: str, assistant_content: str, *, session_id: str = "") -> None:
+    def sync_turn(self, user_content: str, assistant_content: str) -> None:
         """Ingest conversation turn in background (non-blocking)."""
         def _sync():
             try:
