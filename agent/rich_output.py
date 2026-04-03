@@ -14,6 +14,8 @@ DiffRenderer            unified diff → Rich Text with line numbers → ANSI li
 apply_inline_markdown   convert **bold** / *italic* / `code` / ~~strike~~ to ANSI
 apply_block_line        convert block-level markdown (headings, hr, blockquotes,
                         lists) to ANSI on a single line
+render_stateful_blocks  setext headings, blockquote continuation, tables (pass 2)
+StreamingBlockBuffer    streaming-pipeline state machine for stateful blocks
 clean_command_output    strip venv/stacktrace noise from command output
 """
 
@@ -23,12 +25,14 @@ import logging
 import os
 import re
 import shutil
+import unicodedata
 from difflib import SequenceMatcher
 from io import StringIO
 from pathlib import Path
 from typing import Optional
 
 from rich.console import Console, Group
+from rich.markup import escape as _markup_escape
 from rich.style import Style
 from rich.text import Text
 
@@ -260,11 +264,17 @@ class _PygmentsToRich:
         parts: list[str] = []
         for ttype, value in tokens:
             style = self._resolve(ttype)
+            # Use rich.markup.escape() which:
+            #   • doubles backslashes (\ → \\) so they render literally and
+            #     can never accidentally combine with the [ of a closing tag
+            #     to form \[ (Rich's escape for a literal "[")
+            #   • escapes [ → \[ so bracket text is never parsed as markup
+            #   • leaves ] alone — ] needs no escaping in Rich markup
+            esc = _markup_escape(value)
             if style and value.strip():
-                esc = value.replace("[", r"\[").replace("]", r"\]")
                 parts.append(f"[{style}]{esc}[/{style}]")
             else:
-                parts.append(value)
+                parts.append(esc)
         return "".join(parts)
 
     def _resolve(self, ttype) -> Optional[str]:
@@ -300,15 +310,13 @@ class SyntaxHighlighter:
     ) -> str:
         """Return a Rich markup string with syntax colours applied."""
         if not _PYGMENTS:
-            escaped = code.replace("[", r"\[").replace("]", r"\]")
-            return f"[green]{escaped}[/green]"
+            return f"[green]{_markup_escape(code)}[/green]"
         try:
             lexer = self._lexer(code, language, filename)
             return self._fmt.format(list(lexer.get_tokens(code)))
         except Exception as exc:
             logger.debug("Pygments highlight failed: %s", exc)
-            escaped = code.replace("[", r"\[").replace("]", r"\]")
-            return f"[green]{escaped}[/green]"
+            return f"[green]{_markup_escape(code)}[/green]"
 
     # -- ANSI string (for plain print / print_fn) ----------------------------
 
@@ -612,7 +620,10 @@ class DiffRenderer:
                 if add_run:
                     # -→+→- transition: flush current run and start fresh
                     flush_runs()
-                del_run.append((ln_old, line[1:]))
+                # Use ln_new + offset so deletion numbers stay in sync with the
+                # surrounding context/addition lines (all on new-file scale).
+                # ln_old still advances correctly for context-line accounting.
+                del_run.append((ln_new + len(del_run), line[1:]))
                 ln_old += 1
                 continue
 
@@ -643,6 +654,9 @@ class DiffRenderer:
 # ---------------------------------------------------------------------------
 
 _MD_CODE_RE = re.compile(r"`([^`\n]+)`")
+# Bold+italic must be matched before bold/italic individually
+_MD_BOLD_ITALIC_STAR_RE = re.compile(r"\*{3}(.+?)\*{3}")
+_MD_BOLD_ITALIC_UNDER_RE = re.compile(r"(?<![_\w])___(.+?)___(?![_\w])")
 _MD_BOLD_STAR_RE = re.compile(r"\*\*(.+?)\*\*")
 _MD_BOLD_UNDER_RE = re.compile(r"(?<![_\w])__(.+?)__(?![_\w])")
 _MD_ITALIC_STAR_RE = re.compile(r"\*([^*\n]+?)\*")
@@ -650,24 +664,58 @@ _MD_ITALIC_UNDER_RE = re.compile(r"(?<![_\w])_([^_\n]+)_(?![_\w])")
 _MD_STRIKE_RE = re.compile(r"~~(.+?)~~")
 # Images must be matched before links (![  prefix overlaps with [)
 _MD_IMAGE_RE = re.compile(r"!\[([^\]]*)\]\([^)]+\)")
-_MD_LINK_RE = re.compile(r"\[([^\]]+)\]\(([^)]+)\)")
+_MD_LINK_RE = re.compile(r"(?<!\x1b)\[([^\]]+)\]\(([^)]+)\)")
+# Bare URLs — negative lookbehind (?<!\() avoids matching URLs already
+# formatted as "text (url)" by the link step above.
+# Matches https?://, ftp?s://, file:// and bare www. domains.
+_MD_BARE_URL_RE = re.compile(
+    r"(?<!\()"
+    r"(?:(?:https?|ftps?|file)://[^\s\x1b<>\[\]()\"]+|(?<![./\w])www\.[^\s\x1b<>\[\]()\"]+)"
+)
+
+# HTML wrapper tags (may contain inner markdown — processed with reset_suffix)
+_MD_U_RE = re.compile(r"<u>(.*?)</u>", re.IGNORECASE | re.DOTALL)
+_MD_INS_RE = re.compile(r"<ins>(.*?)</ins>", re.IGNORECASE | re.DOTALL)
+_MD_MARK_RE = re.compile(r"<mark>(.*?)</mark>", re.IGNORECASE | re.DOTALL)
+# HTML inline tags (simple — no nested markdown processing needed)
 _MD_EM_RE = re.compile(r"<em>(.*?)</em>", re.IGNORECASE)
+_MD_I_RE = re.compile(r"<i>(.*?)</i>", re.IGNORECASE)
 _MD_STRONG_RE = re.compile(r"<strong>(.*?)</strong>", re.IGNORECASE)
+_MD_B_RE = re.compile(r"<b>(.*?)</b>", re.IGNORECASE)
+_MD_S_RE = re.compile(r"<s>(.*?)</s>", re.IGNORECASE)
+_MD_STRIKE_TAG_RE = re.compile(r"<strike>(.*?)</strike>", re.IGNORECASE)
+_MD_DEL_RE = re.compile(r"<del>(.*?)</del>", re.IGNORECASE)
+_MD_CODE_TAG_RE = re.compile(r"<code>(.*?)</code>", re.IGNORECASE)
+_MD_KBD_RE = re.compile(r"<kbd>(.*?)</kbd>", re.IGNORECASE)
+# Tags with no terminal equivalent — content is preserved, tags stripped
+_MD_STRIP_TAGS_RE = re.compile(r"</?(?:sup|sub)>", re.IGNORECASE)
 
 _MD_BOLD_ANSI = "\033[1m"
 _MD_ITALIC_ANSI = "\033[3m"
+_MD_BOLD_ITALIC_ANSI = "\033[1;3m"
 _MD_STRIKE_ANSI = "\033[9m"
 _MD_CODE_ANSI = "\033[97m"
+_MD_U_ANSI = "\033[4m"
+_MD_MARK_ANSI = "\033[7m"
+_MD_LINK_ANSI = "\033[38;2;88;166;255m\033[4m"  # #58A6FF (GitHub dark-mode blue) + underline
 _MD_RST_ANSI = "\033[0m"
 
 
-def apply_inline_markdown(line: str, reset_suffix: str = "") -> str:
+def apply_inline_markdown(line: str, reset_suffix: str = "", ref_map: "dict[str, str] | None" = None) -> str:
     """Apply ANSI styling to inline markdown spans in a single text line.
 
-    Handles ``**bold**``, ``__bold__``, ``*italic*``, ``_italic_``,
-    ``~~strikethrough~~``, and `` `code` ``.  Backtick spans are processed
-    first and their content is protected from bold/italic passes via
+    Handles ``***bold italic***``, ``___bold italic___``, ``**bold**``,
+    ``__bold__``, ``*italic*``, ``_italic_``, ``~~strikethrough~~``,
+    `` `code` ``, ``<u>``, ``<ins>``, ``<mark>``, ``<em>``, ``<i>``,
+    ``<strong>``, ``<b>``, ``<s>``, ``<strike>``, ``<del>``, ``<code>``,
+    ``<kbd>``.  ``<sup>``/``<sub>`` tags are stripped (no ANSI equivalent).
+    Backtick spans are processed first and protected from later passes via
     placeholder tokens.
+
+    HTML wrapper tags (``<u>``, ``<ins>``, ``<mark>``) are processed before
+    markdown spans via a recursive call with the wrapper style as
+    ``reset_suffix``, so inner bold/italic resets restore the outer
+    underline/highlight rather than dropping it.
 
     ``reset_suffix`` is appended after each closing reset; pass the active
     response-text ANSI colour here so it is restored between adjacent spans
@@ -680,6 +728,18 @@ def apply_inline_markdown(line: str, reset_suffix: str = "") -> str:
 
     rst = _MD_RST_ANSI + reset_suffix
 
+    # Step 0: HTML wrapper tags — process content recursively with the wrapper
+    # style as reset_suffix so inner resets restore the outer style.
+    def _wrap(style: str) -> "re.Callable[[re.Match], str]":  # type: ignore[type-arg]
+        def _sub(m: re.Match) -> str:  # type: ignore[type-arg]
+            inner = apply_inline_markdown(m.group(1), reset_suffix=style, ref_map=ref_map)
+            return f"{style}{inner}{rst}"
+        return _sub
+
+    line = _MD_U_RE.sub(_wrap(_MD_U_ANSI), line)
+    line = _MD_INS_RE.sub(_wrap(_MD_U_ANSI), line)
+    line = _MD_MARK_RE.sub(_wrap(_MD_MARK_ANSI), line)
+
     # Step 1: protect backtick code spans with index placeholders so later
     # passes cannot match * or _ inside them.
     protected: list[str] = []
@@ -690,28 +750,89 @@ def apply_inline_markdown(line: str, reset_suffix: str = "") -> str:
 
     line = _MD_CODE_RE.sub(_protect_code, line)
 
-    # Step 2: bold
-    line = _MD_BOLD_STAR_RE.sub(lambda m: f"{_MD_BOLD_ANSI}{m.group(1)}{rst}", line)
-    line = _MD_BOLD_UNDER_RE.sub(lambda m: f"{_MD_BOLD_ANSI}{m.group(1)}{rst}", line)
+    # Steps 2–5 use _span() so that nested spans inside a bold/italic/strike
+    # delimiter are rendered recursively.  This prevents the _MD_ITALIC_UNDER_RE
+    # lookbehind ((?<![_\w])) from seeing the trailing 'm' of an enclosing ANSI
+    # code (e.g. \033[1m) as a word character and silently skipping the match.
+    # Guard: if the captured content already contains \x1b (ANSI from step 0),
+    # pass it through unchanged to avoid double-processing.
+    def _span(ansi: str) -> "Callable[[re.Match], str]":  # type: ignore[type-arg]
+        def _sub(m: re.Match) -> str:  # type: ignore[type-arg]
+            inner = m.group(1)
+            if "\x1b" not in inner:
+                inner = apply_inline_markdown(inner, reset_suffix=ansi + reset_suffix, ref_map=ref_map)
+            return f"{ansi}{inner}{rst}"
+        return _sub
 
-    # Step 3: italic (runs after bold so ** is already consumed)
-    line = _MD_ITALIC_STAR_RE.sub(lambda m: f"{_MD_ITALIC_ANSI}{m.group(1)}{rst}", line)
-    line = _MD_ITALIC_UNDER_RE.sub(lambda m: f"{_MD_ITALIC_ANSI}{m.group(1)}{rst}", line)
+    # Step 2: bold+italic (must precede bold and italic individually)
+    line = _MD_BOLD_ITALIC_STAR_RE.sub(_span(_MD_BOLD_ITALIC_ANSI), line)
+    line = _MD_BOLD_ITALIC_UNDER_RE.sub(_span(_MD_BOLD_ITALIC_ANSI), line)
 
-    # Step 4: strikethrough
-    line = _MD_STRIKE_RE.sub(lambda m: f"{_MD_STRIKE_ANSI}{m.group(1)}{rst}", line)
+    # Step 3: bold
+    line = _MD_BOLD_STAR_RE.sub(_span(_MD_BOLD_ANSI), line)
+    line = _MD_BOLD_UNDER_RE.sub(_span(_MD_BOLD_ANSI), line)
 
-    # Step 5a: images (before links — ![  prefix overlaps)
+    # Step 4: italic (runs after bold so ** is already consumed)
+    line = _MD_ITALIC_STAR_RE.sub(_span(_MD_ITALIC_ANSI), line)
+    line = _MD_ITALIC_UNDER_RE.sub(_span(_MD_ITALIC_ANSI), line)
+
+    # Step 5: strikethrough
+    line = _MD_STRIKE_RE.sub(_span(_MD_STRIKE_ANSI), line)
+
+    # Step 6a: images (before links — ![  prefix overlaps)
     line = _MD_IMAGE_RE.sub(lambda m: f"\033[2m[img: {m.group(1)}]\033[0m{reset_suffix}", line)
 
-    # Step 5b: links — underline text, discard URL
-    line = _MD_LINK_RE.sub(lambda m: f"\033[4m{m.group(1)} ({m.group(2)})\033[0m{reset_suffix}", line)
+    # Step 6a2: reference link resolution (before inline link step)
+    if ref_map:
+        def _resolve_coll(m: re.Match) -> str:  # type: ignore[type-arg]
+            """[text][] — use text as lookup key."""
+            text_part = m.group(1)
+            url = ref_map.get(text_part.lower())
+            if url:
+                return f"{_MD_LINK_ANSI}{text_part} ({url})\033[0m{reset_suffix}"
+            return m.group(0)
 
-    # Step 5c: HTML inline tags
-    line = _MD_EM_RE.sub(lambda m: f"{_MD_ITALIC_ANSI}{m.group(1)}\033[0m{reset_suffix}", line)
-    line = _MD_STRONG_RE.sub(lambda m: f"{_MD_BOLD_ANSI}{m.group(1)}\033[0m{reset_suffix}", line)
+        def _resolve_use(m: re.Match) -> str:  # type: ignore[type-arg]
+            """[text][ref] — use ref as lookup key."""
+            text_part = m.group(1)
+            ref_key = m.group(2).lower()
+            url = ref_map.get(ref_key)
+            if url:
+                return f"{_MD_LINK_ANSI}{text_part} ({url})\033[0m{reset_suffix}"
+            return m.group(0)
 
-    # Step 6: restore protected code spans
+        # [text][] collapsed ref — must run before [text][ref] to avoid partial match
+        line = _MD_REF_LINK_COLL_RE.sub(_resolve_coll, line)
+        line = _MD_REF_LINK_USE_RE.sub(_resolve_use, line)
+
+    # Step 6b: links — bright-blue underline + URL for copy/ctrl+click
+    line = _MD_LINK_RE.sub(lambda m: f"{_MD_LINK_ANSI}{m.group(1)} ({m.group(2)})\033[0m{reset_suffix}", line)
+
+    # Step 6b2: bare URLs (https?://...) — style the same as markdown links.
+    # Trailing punctuation characters are stripped from the URL and re-appended
+    # so "See https://x.com." doesn't include the period in the styled span.
+    def _bare_url(m: re.Match) -> str:  # type: ignore[type-arg]
+        url = m.group(0).rstrip(".,;:!?)")
+        tail = m.group(0)[len(url):]
+        return f"{_MD_LINK_ANSI}{url}\033[0m{reset_suffix}{tail}"
+
+    line = _MD_BARE_URL_RE.sub(_bare_url, line)
+
+    # Step 6c: HTML inline tags (simple — content taken as-is)
+    line = _MD_EM_RE.sub(lambda m: f"{_MD_ITALIC_ANSI}{m.group(1)}{rst}", line)
+    line = _MD_I_RE.sub(lambda m: f"{_MD_ITALIC_ANSI}{m.group(1)}{rst}", line)
+    line = _MD_STRONG_RE.sub(lambda m: f"{_MD_BOLD_ANSI}{m.group(1)}{rst}", line)
+    line = _MD_B_RE.sub(lambda m: f"{_MD_BOLD_ANSI}{m.group(1)}{rst}", line)
+    line = _MD_S_RE.sub(lambda m: f"{_MD_STRIKE_ANSI}{m.group(1)}{rst}", line)
+    line = _MD_STRIKE_TAG_RE.sub(lambda m: f"{_MD_STRIKE_ANSI}{m.group(1)}{rst}", line)
+    line = _MD_DEL_RE.sub(lambda m: f"{_MD_STRIKE_ANSI}{m.group(1)}{rst}", line)
+    line = _MD_CODE_TAG_RE.sub(lambda m: f"{_MD_CODE_ANSI}{m.group(1)}{rst}", line)
+    line = _MD_KBD_RE.sub(lambda m: f"{_MD_CODE_ANSI}{m.group(1)}{rst}", line)
+
+    # Step 6d: tags with no terminal equivalent — strip tags, keep content
+    line = _MD_STRIP_TAGS_RE.sub("", line)
+
+    # Step 7: restore protected code spans
     for idx, span in enumerate(protected):
         line = line.replace(f"\x00{idx}\x00", span)
 
@@ -728,8 +849,14 @@ def apply_inline_markdown(line: str, reset_suffix: str = "") -> str:
 _MD_HEADING_RE = re.compile(r"^(#{1,6})\s+(.*)")
 _MD_HR_RE = re.compile(r"^(-{3,}|\*{3,}|_{3,})$")
 _MD_BLOCKQUOTE_RE = re.compile(r"^>+\s?(.*)")
+_MD_BQ_LEVEL_RE = re.compile(r"^((?:>\s*)+)(.*)")
 _MD_UL_RE = re.compile(r"^(\s*)([-*+])\s+(.+)")
+_MD_OL_RE = re.compile(r"^(\s*)(\d+)[.)]\s+(.+)")
+_MD_TASK_RE = re.compile(r"^\[( |x|X)\]\s*(.*)", re.IGNORECASE)
 _MD_REF_LINK_RE = re.compile(r"^\[[^\]]+\]:\s+\S+")
+_REF_DEF_RE = re.compile(r'^\[([^\]]+)\]:\s*(\S+)(?:\s+(?:"[^"]*"|\'[^\']*\'|\([^)]*\)))?\s*$')
+_MD_REF_LINK_USE_RE = re.compile(r'\[([^\]]+)\]\[([^\]]*)\]')
+_MD_REF_LINK_COLL_RE = re.compile(r'\[([^\]]+)\]\[\]')
 
 _HEADING_STYLES = {
     1: "\033[1;97m",
@@ -780,12 +907,17 @@ def apply_block_line(line: str) -> str:
         cols = shutil.get_terminal_size((80, 24)).columns
         return f"\033[2m{'─' * cols}\033[0m"
 
-    # Blockquote — collapse any level of nesting to single gutter
-    m = _MD_BLOCKQUOTE_RE.match(line)
+    # Blockquote — render with depth-aware gutter
+    m = _MD_BQ_LEVEL_RE.match(line)
     if m:
-        content = m.group(1)
-        content_rendered = apply_inline_markdown(content, reset_suffix=_BLOCKQUOTE_ANSI)
-        return f"{_BLOCKQUOTE_ANSI}▌ {content_rendered}\033[0m"
+        raw_prefix = m.group(1)
+        content = m.group(2)
+        depth = raw_prefix.count('>')
+        indent = "  " * (depth - 1)
+        dim_prefix = "\033[2m" * min(depth - 1, 2)
+        ansi = dim_prefix + _BLOCKQUOTE_ANSI
+        content_rendered = apply_inline_markdown(content, reset_suffix=ansi)
+        return f"{indent}{ansi}▌ {content_rendered}\033[0m"
 
     # Unordered list — bullet symbol by indent depth
     m = _MD_UL_RE.match(line)
@@ -793,22 +925,764 @@ def apply_block_line(line: str) -> str:
         indent, _marker, content = m.group(1), m.group(2), m.group(3)
         level = len(indent) // 2
         bullet = _BULLETS[min(level, len(_BULLETS) - 1)]
-        return f"{indent}{bullet} {content}"
+        # Task list detection
+        tm = _MD_TASK_RE.match(content)
+        if tm:
+            checkbox_char, rest = tm.group(1), tm.group(2)
+            if checkbox_char.lower() == 'x':
+                checkbox_sym = "\033[1;32m✓\033[0m"
+            else:
+                checkbox_sym = "\033[2m○\033[0m"
+            rest_rendered = apply_inline_markdown(rest)
+            return f"{indent}{bullet} {checkbox_sym} {rest_rendered}"
+        return f"{indent}{bullet} {apply_inline_markdown(content)}"
+
+    # Ordered list — dim numeral, then content
+    m = _MD_OL_RE.match(line)
+    if m:
+        indent, numeral, content = m.group(1), m.group(2), m.group(3)
+        level = len(indent) // 2
+        _ = level  # reserved for future indent-aware styling
+        return f"{indent}\033[2m{numeral}.\033[0m {apply_inline_markdown(content)}"
 
     return line
+
+
+# ---------------------------------------------------------------------------
+# Stateful block rendering: setext headings, blockquote continuation, tables
+# ---------------------------------------------------------------------------
+
+_SETEXT_H1_RE = re.compile(r"^={2,}\s*$")
+_SETEXT_H2_RE = re.compile(r"^-{2,}\s*$")
+_TABLE_STRICT_ROW_RE = re.compile(r"^\|.+\|\s*$")   # pipes at both ends (strict GFM)
+_TABLE_LOOSE_ROW_RE  = re.compile(r"^[^|].+\|")      # no leading pipe, contains | (loose GFM)
+_TABLE_SEP_RE        = re.compile(r"^[\s:\-|]+$")     # separator row (dashes/colons/pipes)
+_SEP_CELL_RE = re.compile(r"^[\s:-]+$")
+_NUM_RE = re.compile(r"^-?[\d,]+\.?\d*$")
+_ANSI_ESC_RE = re.compile(r"\x1b\[[0-9;]*m")
+
+
+def _visual_len(s: str) -> int:
+    """Terminal column width of *s* (ANSI codes stripped, wide/emoji chars = 2 cols).
+
+    Wide characters (east_asian_width W/F) count as 2.  U+FE0F (emoji
+    presentation selector) upgrades the preceding neutral char to 2-wide,
+    matching the behaviour of modern terminal emulators.
+    """
+    plain = _ANSI_ESC_RE.sub("", s)
+    total = 0
+    prev_width = 0
+    for ch in plain:
+        cp = ord(ch)
+        if cp == 0xFE0F:  # emoji presentation selector — upgrade preceding char
+            if prev_width == 1:
+                total += 1
+            prev_width = 0
+            continue
+        w = 2 if unicodedata.east_asian_width(ch) in ("W", "F") else 1
+        total += w
+        prev_width = w
+    return total
+
+
+def _split_row(raw: str) -> list[str]:
+    """Split a raw pipe-row into cell strings.
+
+    Handles both strict GFM (``| A | B |``) and loose GFM (``A | B | C``)
+    formats — leading and trailing ``|`` are stripped when present.
+    """
+    s = raw.strip()
+    if s.startswith("|"):
+        s = s[1:]
+    if s.endswith("|"):
+        s = s[:-1]
+    return s.split("|")
+
+
+def _parse_align(cell: str) -> str:
+    c = cell.strip()
+    if c.startswith(":") and c.endswith(":"):
+        return "centre"
+    if c.endswith(":"):
+        return "right"
+    return "left"
+
+
+_MD_OL_START_RE = re.compile(r"^\s*\d+[.)]")
+
+
+def _is_heading_candidate(pending: Optional[str]) -> bool:
+    if pending is None or pending == "" or "\x1b" in pending:
+        return False
+    # Ordered-list items look like "1. text" or "1) text" — never a setext heading.
+    if _MD_OL_START_RE.match(pending):
+        return False
+    return apply_block_line(pending) is pending
+
+
+def _render_table(rows: list[list[str]], sep_idx: Optional[int], align: list[str], cols: int, framed: bool = False) -> str:
+    if not rows:
+        return ""
+    # Apply inline markdown to every data cell so ANSI styling is accounted for
+    # before measuring visual widths.  Separator rows are kept raw (replaced by
+    # a divider line and never inspected for content).
+    rendered_rows: list[list[str]] = []
+    for i, row in enumerate(rows):
+        if i == sep_idx:
+            rendered_rows.append(row)
+        else:
+            rendered_rows.append([
+                apply_inline_markdown(row[j].strip()) if j < len(row) else ""
+                for j in range(cols)
+            ])
+    data_rows = [r for i, r in enumerate(rendered_rows) if i != sep_idx]
+    widths = [
+        max((_visual_len(row[i]) for row in data_rows if i < len(row)), default=0)
+        for i in range(cols)
+    ]
+    align = list(align) + ["left"] * (cols - len(align))
+
+    def _padded(cell: str, w: int, a: str) -> str:
+        raw = _ANSI_ESC_RE.sub("", cell).strip()
+        pad = w - _visual_len(cell)
+        if a == "right" or _NUM_RE.match(raw):
+            return " " * pad + cell
+        if a == "centre":
+            lpad = pad // 2
+            return " " * lpad + cell + " " * (pad - lpad)
+        return cell + " " * pad
+
+    if framed:
+        def _hline(l: str, m: str, r: str) -> str:
+            return l + m.join("─" * (w + 2) for w in widths) + r
+
+        content = [(i, r) for i, r in enumerate(rendered_rows) if i != sep_idx]
+        out = [_hline("┌", "┬", "┐")]
+        for idx, (_, row) in enumerate(content):
+            cells_str = "│".join(
+                f" {_padded(row[i] if i < len(row) else '', widths[i], align[i])} "
+                for i in range(cols)
+            )
+            out.append(f"│{cells_str}│")
+            if idx < len(content) - 1:
+                out.append(_hline("├", "┼", "┤"))
+        out.append(_hline("└", "┴", "┘"))
+        return "\n".join(out)
+    else:
+        out = []
+        for r_idx, row in enumerate(rendered_rows):
+            if r_idx == sep_idx:
+                out.append(" " + "  ".join("─" * w for w in widths))
+                continue
+            out.append(" " + "  ".join(
+                _padded(row[i] if i < len(row) else "", widths[i], align[i])
+                for i in range(cols)
+            ))
+        return "\n".join(out)
+
+
+def render_stateful_blocks(text: str) -> str:
+    """Pass 2: render setext headings, blockquote continuation lines, and tables.
+
+    Runs a single left-to-right scan.  Skips lines that already contain
+    ``\\x1b`` (highlighted code from pass 1).
+    """
+    # Pre-pass: collect reference link definitions into ref_map
+    ref_map: dict[str, str] = {}
+    for raw_line in text.splitlines():
+        rm = _REF_DEF_RE.match(raw_line.strip())
+        if rm:
+            ref_map[rm.group(1).lower()] = rm.group(2)
+
+    lines = text.splitlines()
+    out: list = []
+
+    _pending: Optional[str] = None
+    _bq_depth: int = 0  # 0 = not in blockquote; >0 = current depth
+    _in_ol: bool = False
+    _ol_indent: int = 0
+    _table_rows: list = []
+    _sep_idx: Optional[int] = None
+    _align: list = []
+    _table_strict: bool = False
+
+    def _emit(s: str) -> None:
+        out.append(s)
+
+    def _flush_pending() -> None:
+        nonlocal _pending
+        if _pending is not None:
+            # If pending is a BQ line, render it with the gutter
+            pm = _MD_BQ_LEVEL_RE.match(_pending)
+            if pm:
+                _emit(_render_bq_depth(pm.group(2), pm.group(1).count('>')))
+            else:
+                _emit(_pending)
+            _pending = None
+
+    def _render_bq_depth(content: str, depth: int) -> str:
+        indent = "  " * (depth - 1)
+        dim_prefix = "\033[2m" * min(depth - 1, 2)
+        ansi = dim_prefix + _BLOCKQUOTE_ANSI
+        content_rendered = apply_inline_markdown(content, reset_suffix=ansi, ref_map=ref_map)
+        return f"{indent}{ansi}▌ {content_rendered}\033[0m"
+
+    def _on_table_row(raw: str) -> None:
+        nonlocal _sep_idx, _align, _table_strict
+        if not _table_rows:  # first row is the header — determines strict vs loose
+            _table_strict = bool(_TABLE_STRICT_ROW_RE.match(raw))
+        header_cols = len(_split_row(_table_rows[0])) if _table_rows else 0
+        cells = _split_row(raw)
+        if _sep_idx is None and cells and all(_SEP_CELL_RE.match(c) for c in cells):
+            _sep_idx = len(_table_rows)
+            _align = [_parse_align(c) for c in cells]
+            _align += ["left"] * (header_cols - len(_align))
+        _table_rows.append(raw)
+
+    def _flush_table_to_out() -> None:
+        nonlocal _sep_idx, _align, _table_strict
+        if not _table_rows:
+            return
+        rows = [_split_row(r) for r in _table_rows]
+        cols = len(rows[0]) if rows else 0
+        rendered = _render_table(rows, _sep_idx, _align, cols, framed=_table_strict)
+        _table_rows.clear()
+        _sep_idx = None
+        _align = []
+        _table_strict = False
+        for tl in rendered.splitlines():
+            _emit(tl)
+
+    for line in lines:
+        # Priority 1: ANSI line — flush any open table, emit immediately.
+        # _pending is intentionally left untouched (spec).
+        # If inside a blockquote, keep the gutter so the code block is visually
+        # contained within the quote; _bq_depth stays and exits on next blank line.
+        if "\x1b" in line:
+            _flush_table_to_out()
+            if _bq_depth:
+                _emit(f"{_BLOCKQUOTE_ANSI}▌ {_MD_RST_ANSI}{line}")
+            else:
+                _bq_depth = 0
+                _emit(line)
+            continue
+
+        # Priority 2: blockquote continuation
+        if _bq_depth:
+            if line == "":
+                # Flush any pending BQ line before exiting
+                if _pending is not None and _MD_BQ_LEVEL_RE.match(_pending):
+                    pm = _MD_BQ_LEVEL_RE.match(_pending)
+                    _emit(_render_bq_depth(pm.group(2), pm.group(1).count('>')))
+                    _pending = None
+                _bq_depth = 0
+                _emit(line)
+            else:
+                bm = _MD_BQ_LEVEL_RE.match(line)
+                if bm:
+                    depth = bm.group(1).count('>')
+                    inner = bm.group(2)
+                    # Feature 4: setext heading inside blockquote
+                    if _pending is not None and _MD_BQ_LEVEL_RE.match(_pending):
+                        pm = _MD_BQ_LEVEL_RE.match(_pending)
+                        pending_inner = pm.group(2)  # type: ignore[union-attr]
+                        if (_SETEXT_H1_RE.match(inner) or _SETEXT_H2_RE.match(inner)) and _is_heading_candidate(pending_inner):
+                            level = 1 if _SETEXT_H1_RE.match(inner) else 2
+                            style = _HEADING_STYLES[level]
+                            rendered_text = apply_inline_markdown(pending_inner, reset_suffix=style, ref_map=ref_map)
+                            heading_out = f"{style}{rendered_text}{_MD_RST_ANSI}"
+                            pending_depth = pm.group(1).count('>')  # type: ignore[union-attr]
+                            pending_indent = "  " * (pending_depth - 1)
+                            dim_prefix = "\033[2m" * min(pending_depth - 1, 2)
+                            ansi = dim_prefix + _BLOCKQUOTE_ANSI
+                            _pending = None
+                            _emit(f"{pending_indent}{ansi}▌ {heading_out}\033[0m")
+                            _bq_depth = depth
+                            continue
+                        # Not setext: flush pending BQ line, buffer new one
+                        _flush_pending()
+                    _bq_depth = depth
+                    _pending = line  # buffer for next setext check
+                else:
+                    # Continuation (non-BQ line): flush any pending BQ line first
+                    if _pending is not None and _MD_BQ_LEVEL_RE.match(_pending):
+                        pm = _MD_BQ_LEVEL_RE.match(_pending)
+                        _emit(_render_bq_depth(pm.group(2), pm.group(1).count('>')))
+                        _pending = None
+                    _emit(_render_bq_depth(line, _bq_depth))
+            continue
+
+        # Priority 3: table accumulation
+        if _table_rows:
+            # Accept strict rows always; accept loose rows (no leading pipe) once
+            # the separator has been seen — after that any pipe-bearing line is a
+            # data row.  Blank lines or pipe-free lines end the table.
+            if _TABLE_STRICT_ROW_RE.match(line) or (_sep_idx is not None and "|" in line):
+                _on_table_row(line)
+                continue
+            else:
+                _flush_table_to_out()
+                # fall through to process this non-table line normally
+
+        # Priority 3b: OL continuation
+        if _in_ol:
+            if line == "":
+                _in_ol = False
+            elif _MD_OL_RE.match(line):
+                # New OL item — check indent vs current _ol_indent
+                om = _MD_OL_RE.match(line)
+                item_indent = len(om.group(1))  # type: ignore[union-attr]
+                if item_indent >= _ol_indent or item_indent > 0:
+                    # Still part of list (same or deeper indent), pass through
+                    pass
+                else:
+                    _in_ol = False
+            elif not line.startswith(" " * max(_ol_indent, 1)):
+                # Continuation lines must be indented at least to marker column
+                _in_ol = False
+
+        # Priority 4: normal mode
+        bm = _MD_BQ_LEVEL_RE.match(line)
+        if bm:
+            _flush_pending()
+            depth = bm.group(1).count('>')
+            inner = bm.group(2)
+            _bq_depth = depth
+            # Setext-in-blockquote lookahead: store raw line as pending
+            _pending = line
+            continue
+
+        if _TABLE_STRICT_ROW_RE.match(line):
+            # If the pending line already contains pipes it is the loose table
+            # header that preceded this strict row — rescue it instead of
+            # emitting it as plain prose.
+            if _pending is not None and "|" in _pending:
+                _on_table_row(_pending)
+                _pending = None
+            else:
+                _flush_pending()
+            _on_table_row(line)
+            continue
+
+        # Loose table separator (no leading pipe, e.g. "---|---|---" or "--- --- ---").
+        # Current line must look like a separator; pending line must be a loose header.
+        if _pending is not None and "|" in _pending and "-" in line and _TABLE_SEP_RE.match(line.strip()):
+            _loose_cells = _split_row(line)
+            if _loose_cells and all(_SEP_CELL_RE.match(c) for c in _loose_cells):
+                _on_table_row(_pending)
+                _pending = None
+                _on_table_row(line)
+                continue
+
+        # Setext marker check
+        if _SETEXT_H1_RE.match(line) or _SETEXT_H2_RE.match(line):
+            if _is_heading_candidate(_pending):
+                level = 1 if _SETEXT_H1_RE.match(line) else 2
+                style = _HEADING_STYLES[level]
+                rendered_text = apply_inline_markdown(_pending, reset_suffix=style, ref_map=ref_map)  # type: ignore[arg-type]
+                heading_out = f"{style}{rendered_text}{_MD_RST_ANSI}"
+                _pending = None
+                _emit(heading_out)
+            else:
+                _flush_pending()
+                _emit(line)
+            continue
+
+        # OL start — track state
+        om = _MD_OL_RE.match(line)
+        if om:
+            _in_ol = True
+            _ol_indent = len(om.group(1))
+
+        # Plain line — setext lookahead (one-tick delay)
+        _flush_pending()
+        _pending = line
+
+    # End of input
+    _flush_table_to_out()
+    # Flush any pending blockquote line (was waiting for setext check)
+    if _pending is not None and _bq_depth and _MD_BQ_LEVEL_RE.match(_pending):
+        pm = _MD_BQ_LEVEL_RE.match(_pending)
+        depth = pm.group(1).count('>')  # type: ignore[union-attr]
+        inner = pm.group(2)  # type: ignore[union-attr]
+        _emit(_render_bq_depth(inner, depth))
+        _pending = None
+    _flush_pending()
+
+    result = "\n".join(out)
+    if text.endswith("\n"):
+        result += "\n"
+    return result
+
+
+class StreamingBlockBuffer:
+    """State machine for stateful block rendering in the streaming pipeline.
+
+    Inserted before ``StreamingCodeBlockHighlighter`` in the streaming loop.
+    Handles setext headings (one-tick lookahead), multi-line blockquote
+    continuation, and table buffering/rendering.
+    """
+
+    def __init__(self) -> None:
+        self._pending: Optional[str] = None
+        self._bq_depth: int = 0  # 0 = not in blockquote; >0 = current depth
+        self._in_ol: bool = False
+        self._ol_indent: int = 0
+        self._table_buf: list = []
+        self._sep_idx: Optional[int] = None
+        self._align: list = []
+        self._table_strict: bool = False
+        self._emit_next: Optional[str] = None
+        self._ref_map: dict[str, str] = {}
+
+    def reset(self) -> None:
+        """Reset all state for a new response turn."""
+        self._pending = None
+        self._bq_depth = 0
+        self._in_ol = False
+        self._ol_indent = 0
+        self._table_buf = []
+        self._sep_idx = None
+        self._align = []
+        self._table_strict = False
+        self._emit_next = None
+        self._ref_map = {}
+
+    def process_line(self, line: str) -> Optional[str]:
+        """Process one line.
+
+        Returns the string to emit (may be multi-line ANSI for tables/setexts),
+        or ``None`` while accumulating a block.  Plain lines are returned with
+        the same object identity as the input so the ``out is line`` identity
+        check downstream still works.
+        """
+        # Priority 1: _emit_next is set — pop and process it; if it resolves to
+        # non-None, defer the current line so it's handled on the next call.
+        if self._emit_next is not None:
+            emit_line = self._emit_next
+            self._emit_next = None
+            result = self._handle_line(emit_line)
+            if result is not None:
+                self._emit_next = line
+                return result
+            # emit_line was buffered (e.g. a table row) — fall through to process line
+
+        return self._handle_line(line)
+
+    def flush(self) -> Optional[str]:
+        """Flush any buffered state at end of stream."""
+        parts = []
+        if self._emit_next is not None:
+            emit_line = self._emit_next
+            self._emit_next = None
+            result = self._handle_line(emit_line)
+            if result is not None:
+                parts.append(result)
+        if self._table_buf:
+            parts.append(self._flush_table_str())
+        if self._pending is not None:
+            # If pending is a blockquote line, render it now
+            if self._bq_depth and _MD_BQ_LEVEL_RE.match(self._pending):
+                pm = _MD_BQ_LEVEL_RE.match(self._pending)
+                depth = pm.group(1).count('>')  # type: ignore[union-attr]
+                inner = pm.group(2)  # type: ignore[union-attr]
+                parts.append(self._render_bq_depth(inner, depth))
+            else:
+                parts.append(self._pending)
+            self._pending = None
+        if parts:
+            return "\n".join(parts)
+        return None
+
+    # ------------------------------------------------------------------
+    # Internal helpers
+    # ------------------------------------------------------------------
+
+    def _handle_line(self, line: str) -> Optional[str]:
+        """Core state machine: priorities 2–4."""
+        # Collect reference link definitions as they arrive (streaming pre-pass)
+        rm = _REF_DEF_RE.match(line.strip())
+        if rm:
+            self._ref_map[rm.group(1).lower()] = rm.group(2)
+
+        # Priority 2: blockquote continuation
+        if self._bq_depth:
+            if "\x1b" in line:
+                # Rare: raw ANSI in stream while in blockquote — keep gutter
+                # Flush any pending BQ line first
+                if self._pending is not None:
+                    pm = _MD_BQ_LEVEL_RE.match(self._pending)
+                    if pm:
+                        inner = pm.group(2)
+                        depth = pm.group(1).count('>')
+                        old = self._pending
+                        self._pending = None
+                        self._emit_next = line
+                        return self._render_bq_depth(inner, depth)
+                return f"{_BLOCKQUOTE_ANSI}▌ {_MD_RST_ANSI}{line}"
+            if line == "":
+                # Flush pending BQ line before exiting blockquote
+                if self._pending is not None:
+                    pm = _MD_BQ_LEVEL_RE.match(self._pending)
+                    if pm:
+                        inner = pm.group(2)
+                        depth = pm.group(1).count('>')
+                        self._pending = None
+                        self._bq_depth = 0
+                        self._emit_next = line
+                        return self._render_bq_depth(inner, depth)
+                self._bq_depth = 0
+                return line
+            # Code fence — exit blockquote so StreamingCodeBlockHighlighter
+            # can handle it normally (gutter on the fence itself isn't possible
+            # once the line passes to the code highlighter)
+            if line.strip().startswith("```"):
+                if self._pending is not None:
+                    pm = _MD_BQ_LEVEL_RE.match(self._pending)
+                    if pm:
+                        inner = pm.group(2)
+                        depth = pm.group(1).count('>')
+                        self._pending = None
+                        self._bq_depth = 0
+                        self._emit_next = line
+                        return self._render_bq_depth(inner, depth)
+                self._bq_depth = 0
+                return line
+            bm = _MD_BQ_LEVEL_RE.match(line)
+            if bm:
+                depth = bm.group(1).count('>')
+                inner = bm.group(2)
+                # Feature 4: setext heading inside blockquote
+                # Check if pending is a BQ line and current inner is setext
+                if self._pending is not None and _MD_BQ_LEVEL_RE.match(self._pending):
+                    pm = _MD_BQ_LEVEL_RE.match(self._pending)
+                    pending_inner = pm.group(2)  # type: ignore[union-attr]
+                    if (_SETEXT_H1_RE.match(inner) or _SETEXT_H2_RE.match(inner)) and _is_heading_candidate(pending_inner):
+                        level = 1 if _SETEXT_H1_RE.match(inner) else 2
+                        style = _HEADING_STYLES[level]
+                        rendered_text = apply_inline_markdown(pending_inner, reset_suffix=style, ref_map=self._ref_map)
+                        heading_out = f"{style}{rendered_text}{_MD_RST_ANSI}"
+                        pending_depth = pm.group(1).count('>')  # type: ignore[union-attr]
+                        pending_indent = "  " * (pending_depth - 1)
+                        dim_prefix = "\033[2m" * min(pending_depth - 1, 2)
+                        ansi = dim_prefix + _BLOCKQUOTE_ANSI
+                        self._pending = None
+                        self._bq_depth = depth
+                        return f"{pending_indent}{ansi}▌ {heading_out}\033[0m"
+                # Flush old pending BQ line, then buffer this new one for setext lookahead
+                if self._pending is not None and _MD_BQ_LEVEL_RE.match(self._pending):
+                    pm = _MD_BQ_LEVEL_RE.match(self._pending)
+                    old_inner = pm.group(2)  # type: ignore[union-attr]
+                    old_depth = pm.group(1).count('>')  # type: ignore[union-attr]
+                    rendered = self._render_bq_depth(old_inner, old_depth)
+                    self._pending = line
+                    self._bq_depth = depth
+                    return rendered
+                self._bq_depth = depth
+                self._pending = line
+                return None  # buffered for setext lookahead
+            # Continuation (non-BQ line while in blockquote)
+            # Flush any pending BQ line first
+            if self._pending is not None and _MD_BQ_LEVEL_RE.match(self._pending):
+                pm = _MD_BQ_LEVEL_RE.match(self._pending)
+                inner = pm.group(2)  # type: ignore[union-attr]
+                depth = pm.group(1).count('>')  # type: ignore[union-attr]
+                rendered = self._render_bq_depth(inner, depth)
+                self._pending = None
+                self._emit_next = line
+                return rendered
+            return self._render_bq_depth(line, self._bq_depth)
+
+        # Priority 3: table accumulation
+        if self._table_buf:
+            if _TABLE_STRICT_ROW_RE.match(line) or (self._sep_idx is not None and "|" in line):
+                self._on_table_row(line)
+                return None
+            else:
+                rendered = self._flush_table_str()
+                self._emit_next = line
+                return rendered
+
+        # Priority 3b: OL continuation tracking
+        if self._in_ol:
+            if line == "":
+                self._in_ol = False
+            elif _MD_OL_RE.match(line):
+                om = _MD_OL_RE.match(line)
+                item_indent = len(om.group(1))  # type: ignore[union-attr]
+                if item_indent < self._ol_indent and item_indent == 0:
+                    self._in_ol = False
+            elif not line.startswith(" " * max(self._ol_indent, 1)):
+                self._in_ol = False
+
+        # Priority 4: normal mode
+        # Blockquote start
+        bm = _MD_BQ_LEVEL_RE.match(line)
+        if bm:
+            depth = bm.group(1).count('>')
+            if self._pending is not None:
+                result = self._pending
+                self._pending = None
+                self._emit_next = line
+                self._bq_depth = depth
+                return result
+            self._bq_depth = depth
+            # Buffer the first BQ line for setext-in-blockquote lookahead
+            self._pending = line
+            return None
+
+        # Table row start
+        if _TABLE_STRICT_ROW_RE.match(line):
+            if self._pending is not None and "|" in self._pending:
+                # Pending line is a loose table header — rescue it.
+                self._on_table_row(self._pending)
+                self._pending = None
+                self._on_table_row(line)
+                return None
+            elif self._pending is not None:
+                result = self._pending
+                self._pending = None
+                self._emit_next = line
+                return result
+            self._on_table_row(line)
+            return None
+
+        # Loose table separator (no leading pipe, e.g. "---|---|---" or "--- --- ---").
+        if self._pending is not None and "|" in self._pending and "-" in line and _TABLE_SEP_RE.match(line.strip()):
+            _loose_cells = _split_row(line)
+            if _loose_cells and all(_SEP_CELL_RE.match(c) for c in _loose_cells):
+                self._on_table_row(self._pending)
+                self._pending = None
+                self._on_table_row(line)
+                return None
+
+        # Setext marker
+        if _SETEXT_H1_RE.match(line) or _SETEXT_H2_RE.match(line):
+            if _is_heading_candidate(self._pending):
+                level = 1 if _SETEXT_H1_RE.match(line) else 2
+                style = _HEADING_STYLES[level]
+                rendered_text = apply_inline_markdown(self._pending, reset_suffix=style, ref_map=self._ref_map)  # type: ignore[arg-type]
+                heading = f"{style}{rendered_text}{_MD_RST_ANSI}"
+                self._pending = None
+                return heading
+            else:
+                old = self._pending
+                self._pending = line
+                return old  # None if nothing was pending
+
+        # OL start — track state
+        om = _MD_OL_RE.match(line)
+        if om:
+            self._in_ol = True
+            self._ol_indent = len(om.group(1))
+
+        # Plain line (or ANSI when _pending is None — return immediately)
+        if "\x1b" in line and self._pending is None:
+            return line
+
+        old = self._pending
+        self._pending = line
+        return old  # None if _pending was None
+
+    def _render_bq_depth(self, content: str, depth: int) -> str:
+        indent = "  " * (depth - 1)
+        dim_prefix = "\033[2m" * min(depth - 1, 2)
+        ansi = dim_prefix + _BLOCKQUOTE_ANSI
+        content_rendered = apply_inline_markdown(content, reset_suffix=ansi, ref_map=self._ref_map)
+        return f"{indent}{ansi}▌ {content_rendered}\033[0m"
+
+    def _render_bq(self, content: str) -> str:
+        return self._render_bq_depth(content, max(self._bq_depth, 1))
+
+    def _on_table_row(self, raw: str) -> None:
+        if not self._table_buf:  # first row is the header — determines strict vs loose
+            self._table_strict = bool(_TABLE_STRICT_ROW_RE.match(raw))
+        header_cols = len(_split_row(self._table_buf[0])) if self._table_buf else 0
+        cells = _split_row(raw)
+        if self._sep_idx is None and cells and all(_SEP_CELL_RE.match(c) for c in cells):
+            self._sep_idx = len(self._table_buf)
+            self._align = [_parse_align(c) for c in cells]
+            self._align += ["left"] * (header_cols - len(self._align))
+        self._table_buf.append(raw)
+
+    def _flush_table_str(self) -> str:
+        rows = [_split_row(r) for r in self._table_buf]
+        cols = len(rows[0]) if rows else 0
+        rendered = _render_table(rows, self._sep_idx, self._align, cols, framed=self._table_strict)
+        self._table_buf = []
+        self._sep_idx = None
+        self._align = []
+        self._table_strict = False
+        return rendered
+
+
+# ---------------------------------------------------------------------------
+# Code block line numbers
+# ---------------------------------------------------------------------------
+
+def _number_code_lines(highlighted: str) -> str:
+    """Prepend dim line numbers to each line of a highlighted code block."""
+    lines = highlighted.splitlines()
+    if not lines:
+        return highlighted
+    width = len(str(len(lines)))
+    out = []
+    for i, line in enumerate(lines, 1):
+        out.append(f"\033[2m{i:>{width}} \u2502\033[0m {line}")
+    return "\n".join(out)
 
 
 # ---------------------------------------------------------------------------
 # Public: fenced code block highlighting for LLM responses
 # ---------------------------------------------------------------------------
 
+# ANSI styling for inline code spans (`like this`):
+# dark gray background (256-colour index 237) + bright white text.
+_ANSI_INLINE_CODE_START = "\033[48;5;237m\033[97m"
+_ANSI_INLINE_CODE_END = "\033[0m"
+
+# Single backtick span: one or more non-backtick, non-newline characters.
+_INLINE_CODE_RE = re.compile(r"`([^`\n]+)`")
+
+
+def _highlight_inline_code(text: str) -> str:
+    """Apply ANSI styling to inline code spans (single backticks) in prose text.
+
+    Preserves the backticks so the boundary is still visible; only applies
+    a background/foreground colour change to distinguish code from prose.
+    Does NOT touch triple-backtick fenced blocks — callers must ensure
+    this is only called on prose segments, not on code block content.
+    """
+    return _INLINE_CODE_RE.sub(
+        lambda m: f"{_ANSI_INLINE_CODE_START}`{m.group(1)}`{_ANSI_INLINE_CODE_END}",
+        text,
+    )
+
+
+def _number_code_lines(highlighted: str) -> str:
+    """Prepend dim right-justified line numbers to each line of a highlighted code block."""
+    lines = highlighted.splitlines()
+    if not lines:
+        return highlighted
+    width = len(str(len(lines)))
+    out = []
+    for i, line in enumerate(lines, 1):
+        out.append(f"\033[2m{i:>{width}} \u2502\033[0m {line}")
+    return "\n".join(out)
+
+
 def format_response(text: str) -> str:
     """Apply syntax highlighting and markdown rendering to a complete response string.
 
-    Pass 1: replaces each `` ```lang\\ncode\\n``` `` block with an
-    ANSI-highlighted version.  Pass 2: applies block-level then inline markdown
-    (headings, hr, blockquotes, lists, bold, italic, code spans, etc.) to every
-    non-code line.  Suitable for the non-streaming Rich Panel display path.
+    Pass 1: replaces each fenced code block with an ANSI-highlighted version.
+    Pass 2: ``render_stateful_blocks`` — setext headings, blockquote
+    continuation, and tables.
+    Pass 3: per non-ANSI line — ``apply_block_line`` then
+    ``apply_inline_markdown`` (headings, hr, blockquotes, lists, bold, italic,
+    code spans, etc.).
+
+
+    Suitable for the non-streaming Rich Panel display path.
     """
     _hl = SyntaxHighlighter()
     _det = LanguageDetector()
@@ -821,25 +1695,29 @@ def format_response(text: str) -> str:
         if not lang:
             lang = _det.detect_from_content(code)
         highlighted = _hl.to_ansi(code, language=lang).rstrip("\n")
-        # Some lexers (e.g. plain-text) emit lines with no ANSI codes.
-        # Pass 2 uses `"\x1b" in l` to detect already-highlighted lines and
-        # skip markdown rendering.  Guarantee every code-block line has at
-        # least one escape by prepending a no-op reset to bare lines.
-        lines_out = []
-        for line in highlighted.splitlines():
-            lines_out.append(line if "\x1b" in line else _RST + line)
-        return "\n".join(lines_out)
+        # _number_code_lines prepends dim line-number prefix ensuring every
+        # line has at least one ANSI escape — safe for pass-2 \x1b detection.
+        return _number_code_lines(highlighted)
+
+    # Pre-pass: collect reference link definitions for inline resolution
+    ref_map: dict[str, str] = {}
+    for raw_line in text.splitlines():
+        rm = _REF_DEF_RE.match(raw_line.strip())
+        if rm:
+            ref_map[rm.group(1).lower()] = rm.group(2)
 
     # Match fenced code blocks of any depth (3+ backticks); \1 backreference
     # ensures the closing fence uses the same backtick sequence as the opener.
     text = re.sub(r"(?m)^(`{3,})(\w*)\n(.*?)\1", _highlight, text, flags=re.DOTALL)
-    # Block + inline markdown pass — lines with \x1b are already highlighted code.
+    # Pass 2: stateful block elements (setext headings, blockquote continuation, tables)
+    text = render_stateful_blocks(text)
+    # Pass 3: per non-ANSI line — block + inline markdown.
     # Use splitlines() (no keepends) so apply_block_line never receives a trailing
     # \n that its capture groups would silently drop.  Rejoin manually and restore
     # the final newline if the original text ended with one.
     lines = text.splitlines()
     result = "\n".join(
-        l if "\x1b" in l else apply_inline_markdown(apply_block_line(l))
+        l if "\x1b" in l else apply_inline_markdown(apply_block_line(l), ref_map=ref_map)
         for l in lines
     )
     if text.endswith("\n"):
@@ -896,7 +1774,7 @@ class StreamingCodeBlockHighlighter:
                 self._lang = m.group(2) or None
                 self._buf = []
                 return None  # suppress opening fence — will re-emit with block
-            return line  # plain text, pass through
+            return _highlight_inline_code(line)  # prose: style any inline code spans
 
         # Inside a code block — closing fence: >= fence_depth backticks, nothing else
         m = self._FENCE_CLOSE_RE.match(stripped)
@@ -925,7 +1803,7 @@ class StreamingCodeBlockHighlighter:
         self._in_block = False
         self._lang = None
         self._buf = []
-        return highlighted
+        return _number_code_lines(highlighted)
 
 
 # ---------------------------------------------------------------------------
