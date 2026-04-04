@@ -225,8 +225,22 @@ class HonchoMemoryProvider(MemoryProvider):
     def get_config_schema(self):
         return [
             {"key": "api_key", "description": "Honcho API key", "secret": True, "env_var": "HONCHO_API_KEY", "url": "https://app.honcho.dev"},
-            {"key": "base_url", "description": "Honcho base URL", "default": "https://api.honcho.dev"},
+            {"key": "baseUrl", "description": "Honcho base URL (for self-hosted)"},
+            {"key": "observation", "description": "Observation preset: directional (default), unified, off, or JSON object with per-peer booleans"},
+            {"key": "messageMaxChars", "description": "Max chars per Honcho message (default 25000). Longer messages are chunked."},
+            {"key": "dialecticDynamic", "description": "Auto-bump reasoning level for dialectic queries (default true)"},
+            {"key": "dialecticMaxInputChars", "description": "Max chars for dialectic input queries (default 10000)"},
         ]
+
+    def post_setup(self, hermes_home: str, config: dict) -> None:
+        """Run the full Honcho setup wizard after provider selection."""
+        try:
+            import types
+            from plugins.memory.honcho.cli import cmd_setup
+            cmd_setup(types.SimpleNamespace())
+        except ImportError:
+            # cli.py not present in this checkout — fall through to generic setup
+            pass
 
     def initialize(self, session_id: str, **kwargs) -> None:
         """Initialize Honcho session manager."""
@@ -304,17 +318,70 @@ class HonchoMemoryProvider(MemoryProvider):
         )
         self._prefetch_thread.start()
 
+    @staticmethod
+    def _chunk_message(content: str, limit: int) -> list[str]:
+        """Split content into chunks that fit within the Honcho message limit.
+
+        Splits at paragraph boundaries when possible, falling back to
+        sentence boundaries, then word boundaries. Each continuation
+        chunk is prefixed with "[continued] " so Honcho's representation
+        engine can reconstruct the full message.
+        """
+        if len(content) <= limit:
+            return [content]
+
+        prefix = "[continued] "
+        prefix_len = len(prefix)
+        chunks = []
+        remaining = content
+        first = True
+        while remaining:
+            budget = limit if first else limit - prefix_len
+            if len(remaining) <= budget:
+                chunks.append(remaining if first else prefix + remaining)
+                break
+
+            effective_limit = limit if first else limit - prefix_len
+            segment = remaining[:effective_limit]
+
+            # Try paragraph break, then sentence, then word
+            cut = segment.rfind("\n\n")
+            if cut < effective_limit * 0.3:
+                cut = segment.rfind(". ")
+                if cut >= 0:
+                    cut += 2  # include the period and space
+            if cut < effective_limit * 0.3:
+                cut = segment.rfind(" ")
+            if cut < effective_limit * 0.3:
+                cut = effective_limit  # hard cut
+
+            chunk = remaining[:cut].rstrip()
+            remaining = remaining[cut:].lstrip()
+            if not first:
+                chunk = prefix + chunk
+            chunks.append(chunk)
+            first = False
+
+        return chunks
+
     def sync_turn(self, user_content: str, assistant_content: str) -> None:
-        """Record the conversation turn in Honcho (non-blocking)."""
+        """Record the conversation turn in Honcho (non-blocking).
+
+        Messages exceeding the Honcho API limit (default 25k chars) are
+        split into multiple messages with continuation markers.
+        """
         if not self._manager or not self._session_key:
             return
+
+        msg_limit = self._config.message_max_chars if self._config else 25000
 
         def _sync():
             try:
                 session = self._manager.get_or_create_session(self._session_key)
-                session.add_message("user", user_content[:4000])
-                session.add_message("assistant", assistant_content[:4000])
-                # Flush to Honcho API
+                for chunk in self._chunk_message(user_content, msg_limit):
+                    session.add_message("user", chunk)
+                for chunk in self._chunk_message(assistant_content, msg_limit):
+                    session.add_message("assistant", chunk)
                 self._manager._flush_session(session)
             except Exception as e:
                 logger.debug("Honcho sync_turn failed: %s", e)
@@ -430,6 +497,11 @@ class HonchoMemoryProvider(MemoryProvider):
                 query = args.get("query", "")
                 if not query:
                     return json.dumps({"error": "Missing required parameter: query"})
+                # Dialectic input guard — truncate long queries
+                max_input = self._config.dialectic_max_input_chars if self._config else 10000
+                if len(query) > max_input:
+                    query = query[:max_input]
+                    logger.debug("Truncated dialectic query to %d chars", max_input)
                 peer_arg = args.get("peer", "user")
                 peer = self._resolve_peer(peer_arg)
                 result = peer.chat(query) or ""
