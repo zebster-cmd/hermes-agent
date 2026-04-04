@@ -7,18 +7,10 @@ automatic memory extraction, and session management.
 Original PR #3369 by Mibayy, rewritten to use the full OpenViking session
 lifecycle instead of read-only search endpoints.
 
-API validated against live OpenViking server OpenAPI spec at /openapi.json.
-Endpoint mapping:
-  Filesystem: GET /api/v1/fs/{ls,tree,stat}?uri=
-  Content:    GET /api/v1/content/{read,abstract,overview}?uri=
-  Search:     POST /api/v1/search/find
-  Resources:  POST /api/v1/resources
-  Sessions:   POST /api/v1/sessions/{id}/messages, /commit
-
 Config via environment variables (profile-scoped via each profile's .env):
   OPENVIKING_ENDPOINT  — Server URL (default: http://127.0.0.1:1933)
   OPENVIKING_API_KEY   — API key (required for authenticated servers)
-  OPENVIKING_ACCOUNT   — Tenant account (default: default)
+  OPENVIKING_ACCOUNT   — Tenant account (default: root)
   OPENVIKING_USER      — Tenant user (default: default)
 
 Capabilities:
@@ -65,7 +57,7 @@ class _VikingClient:
                  account: str = "", user: str = ""):
         self._endpoint = endpoint.rstrip("/")
         self._api_key = api_key
-        self._account = account or os.environ.get("OPENVIKING_ACCOUNT", "default")
+        self._account = account or os.environ.get("OPENVIKING_ACCOUNT", "root")
         self._user = user or os.environ.get("OPENVIKING_USER", "default")
         self._httpx = _get_httpx()
         if self._httpx is None:
@@ -238,8 +230,6 @@ class OpenVikingMemoryProvider(MemoryProvider):
         self._client: Optional[_VikingClient] = None
         self._endpoint = ""
         self._api_key = ""
-        self._account = "default"
-        self._user = "default"
         self._session_id = ""
         self._turn_count = 0
         self._sync_thread: Optional[threading.Thread] = None
@@ -252,26 +242,8 @@ class OpenVikingMemoryProvider(MemoryProvider):
         return "openviking"
 
     def is_available(self) -> bool:
-        """Check if OpenViking endpoint is configured. No network calls.
-
-        Checks env vars first, then falls back to reading the .env file
-        directly (needed when called outside the CLI runtime, e.g. during
-        'hermes memory setup' or 'hermes doctor').
-        """
-        if os.environ.get("OPENVIKING_ENDPOINT"):
-            return True
-        # Fallback: read .env file directly for out-of-process checks
-        try:
-            from hermes_cli.config import get_env_path
-            env_path = get_env_path()
-            if env_path.exists():
-                for line in env_path.read_text().splitlines():
-                    line = line.strip()
-                    if line.startswith("OPENVIKING_ENDPOINT=") and line.split("=", 1)[1].strip():
-                        return True
-        except Exception:
-            pass
-        return False
+        """Check if OpenViking endpoint is configured. No network calls."""
+        return bool(os.environ.get("OPENVIKING_ENDPOINT"))
 
     def get_config_schema(self):
         return [
@@ -288,35 +260,16 @@ class OpenVikingMemoryProvider(MemoryProvider):
                 "secret": True,
                 "env_var": "OPENVIKING_API_KEY",
             },
-            {
-                "key": "account",
-                "description": "OpenViking account ID (trusted auth mode)",
-                "default": "default",
-                "env_var": "OPENVIKING_ACCOUNT",
-            },
-            {
-                "key": "user",
-                "description": "OpenViking user ID (trusted auth mode)",
-                "default": "default",
-                "env_var": "OPENVIKING_USER",
-            },
         ]
-
-    def _make_client(self) -> _VikingClient:
-        """Create a new client instance with current auth params."""
-        return _VikingClient(self._endpoint, self._api_key,
-                             self._account, self._user)
 
     def initialize(self, session_id: str, **kwargs) -> None:
         self._endpoint = os.environ.get("OPENVIKING_ENDPOINT", _DEFAULT_ENDPOINT)
         self._api_key = os.environ.get("OPENVIKING_API_KEY", "")
-        self._account = os.environ.get("OPENVIKING_ACCOUNT", "default")
-        self._user = os.environ.get("OPENVIKING_USER", "default")
         self._session_id = session_id
         self._turn_count = 0
 
         try:
-            self._client = self._make_client()
+            self._client = _VikingClient(self._endpoint, self._api_key)
             if not self._client.health():
                 logger.warning("OpenViking server at %s is not reachable", self._endpoint)
                 self._client = None
@@ -350,7 +303,7 @@ class OpenVikingMemoryProvider(MemoryProvider):
                 "viking_remember, viking_add_resource."
             )
 
-    def prefetch(self, query: str) -> str:
+    def prefetch(self, query: str, *, session_id: str = "") -> str:
         """Return prefetched results from the background thread."""
         if self._prefetch_thread and self._prefetch_thread.is_alive():
             self._prefetch_thread.join(timeout=3.0)
@@ -361,17 +314,17 @@ class OpenVikingMemoryProvider(MemoryProvider):
             return ""
         return f"## OpenViking Context\n{result}"
 
-    def queue_prefetch(self, query: str) -> None:
+    def queue_prefetch(self, query: str, *, session_id: str = "") -> None:
         """Fire a background search to pre-load relevant context."""
         if not self._client or not query:
             return
 
         def _run():
             try:
-                client = self._make_client()
+                client = _VikingClient(self._endpoint, self._api_key)
                 resp = client.post("/api/v1/search/find", {
                     "query": query,
-                    "limit": 5,
+                    "top_k": 5,
                 })
                 result = resp.get("result", {})
                 parts = []
@@ -394,7 +347,7 @@ class OpenVikingMemoryProvider(MemoryProvider):
         )
         self._prefetch_thread.start()
 
-    def sync_turn(self, user_content: str, assistant_content: str) -> None:
+    def sync_turn(self, user_content: str, assistant_content: str, *, session_id: str = "") -> None:
         """Record the conversation turn in OpenViking's session (non-blocking)."""
         if not self._client:
             return
@@ -403,7 +356,7 @@ class OpenVikingMemoryProvider(MemoryProvider):
 
         def _sync():
             try:
-                client = self._make_client()
+                client = _VikingClient(self._endpoint, self._api_key)
                 sid = self._session_id
 
                 # Add user message
@@ -454,12 +407,14 @@ class OpenVikingMemoryProvider(MemoryProvider):
 
         def _write():
             try:
-                client = self._make_client()
+                client = _VikingClient(self._endpoint, self._api_key)
                 # Add as a user message with memory context so the commit
                 # picks it up as an explicit memory during extraction
                 client.post(f"/api/v1/sessions/{self._session_id}/messages", {
                     "role": "user",
-                    "content": f"[Memory note — {target}] {content}",
+                    "parts": [
+                        {"type": "text", "text": f"[Memory note — {target}] {content}"},
+                    ],
                 })
             except Exception as e:
                 logger.debug("OpenViking memory mirror failed: %s", e)
@@ -509,7 +464,7 @@ class OpenVikingMemoryProvider(MemoryProvider):
         if args.get("scope"):
             payload["target_uri"] = args["scope"]
         if args.get("limit"):
-            payload["limit"] = args["limit"]
+            payload["top_k"] = args["limit"]
 
         resp = self._client.post("/api/v1/search/find", payload)
         result = resp.get("result", {})
@@ -540,20 +495,16 @@ class OpenVikingMemoryProvider(MemoryProvider):
             return json.dumps({"error": "uri is required"})
 
         level = args.get("level", "overview")
-        # Map our level names to OpenViking GET endpoints:
-        #   abstract -> GET /api/v1/content/abstract?uri=
-        #   overview -> GET /api/v1/content/overview?uri=
-        #   full     -> GET /api/v1/content/read?uri=
-        endpoint_map = {
-            "abstract": "/api/v1/content/abstract",
-            "overview": "/api/v1/content/overview",
-            "full": "/api/v1/content/read",
-        }
-        endpoint = endpoint_map.get(level, "/api/v1/content/overview")
-        resp = self._client.get(endpoint, params={"uri": uri})
+        # Map our level names to OpenViking GET endpoints
+        if level == "abstract":
+            resp = self._client.get("/api/v1/content/abstract", params={"uri": uri})
+        elif level == "full":
+            resp = self._client.get("/api/v1/content/read", params={"uri": uri})
+        else:  # overview
+            resp = self._client.get("/api/v1/content/overview", params={"uri": uri})
 
         result = resp.get("result", "")
-        # Content endpoints return the string directly in result
+        # result is a plain string from the content endpoints
         content = result if isinstance(result, str) else result.get("content", "")
 
         # Truncate very long content to avoid flooding the context
@@ -571,16 +522,12 @@ class OpenVikingMemoryProvider(MemoryProvider):
         path = args.get("path", "viking://")
 
         # Map action to the correct fs endpoint (all GET with uri= param)
-        endpoint_map = {
-            "tree": "/api/v1/fs/tree",
-            "list": "/api/v1/fs/ls",
-            "stat": "/api/v1/fs/stat",
-        }
+        endpoint_map = {"tree": "/api/v1/fs/tree", "list": "/api/v1/fs/ls", "stat": "/api/v1/fs/stat"}
         endpoint = endpoint_map.get(action, "/api/v1/fs/ls")
         resp = self._client.get(endpoint, params={"uri": path})
         result = resp.get("result", {})
 
-        # Format list/tree results for readability — API returns a list
+        # Format list/tree results for readability
         if action in ("list", "tree") and isinstance(result, list):
             entries = []
             for e in result[:50]:  # cap at 50 entries
@@ -608,7 +555,9 @@ class OpenVikingMemoryProvider(MemoryProvider):
 
         self._client.post(f"/api/v1/sessions/{self._session_id}/messages", {
             "role": "user",
-            "content": text,
+            "parts": [
+                {"type": "text", "text": text},
+            ],
         })
 
         return json.dumps({
