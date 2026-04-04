@@ -111,7 +111,27 @@ class HonchoSessionManager:
             config.dialectic_max_chars if config else 600
         )
         self._observation_mode: str = (
-            config.observation_mode if config else "unified"
+            config.observation_mode if config else "directional"
+        )
+        # Granular observation booleans — resolved from config
+        self._user_observe_me: bool = (
+            config.user_observe_me if config else True
+        )
+        self._user_observe_others: bool = (
+            config.user_observe_others if config else False
+        )
+        self._ai_observe_me: bool = (
+            config.ai_observe_me if config else False
+        )
+        self._ai_observe_others: bool = (
+            config.ai_observe_others if config else True
+        )
+        # Dialectic controls
+        self._dialectic_dynamic: bool = (
+            config.dialectic_dynamic if config else True
+        )
+        self._dialectic_max_input_chars: int = (
+            config.dialectic_max_input_chars if config else 10000
         )
 
         # Async write queue — started lazily on first enqueue
@@ -162,20 +182,39 @@ class HonchoSessionManager:
 
         session = self.honcho.session(session_id)
 
-        # Configure peer observation settings based on observation_mode.
-        # Unified: user peer observes self, AI peer passive — all agents share
-        #          one observation pool via user self-observations.
-        # Directional: AI peer observes user — each agent keeps its own view.
+        # Configure peer observation settings using granular booleans.
+        # These are resolved from the observation mode preset or from
+        # individual per-peer overrides in honcho.json.
         try:
             from honcho.session import SessionPeerConfig
-            if self._observation_mode == "directional":
-                user_config = SessionPeerConfig(observe_me=True, observe_others=False)
-                ai_config = SessionPeerConfig(observe_me=False, observe_others=True)
-            else:  # unified (default)
-                user_config = SessionPeerConfig(observe_me=True, observe_others=False)
-                ai_config = SessionPeerConfig(observe_me=False, observe_others=False)
+            user_config = SessionPeerConfig(
+                observe_me=self._user_observe_me,
+                observe_others=self._user_observe_others,
+            )
+            ai_config = SessionPeerConfig(
+                observe_me=self._ai_observe_me,
+                observe_others=self._ai_observe_others,
+            )
 
             session.add_peers([(user_peer, user_config), (assistant_peer, ai_config)])
+
+            # Sync back server-side observation config — dashboard changes
+            # take effect on next session without a code redeploy.
+            try:
+                for peer_obj, local_conf in [(user_peer, user_config), (assistant_peer, ai_config)]:
+                    server_conf = session.get_peer_configuration(peer_obj)
+                    if server_conf:
+                        if hasattr(server_conf, "observe_me"):
+                            local_conf.observe_me = server_conf.observe_me
+                        if hasattr(server_conf, "observe_others"):
+                            local_conf.observe_others = server_conf.observe_others
+                # Update local state from synced values
+                self._user_observe_me = user_config.observe_me
+                self._user_observe_others = user_config.observe_others
+                self._ai_observe_me = ai_config.observe_me
+                self._ai_observe_others = ai_config.observe_others
+            except Exception as e:
+                logger.debug("Could not sync server-side observation config: %s", e)
         except Exception as e:
             logger.warning(
                 "Honcho session '%s' add_peers failed (non-fatal): %s",
@@ -456,6 +495,9 @@ class HonchoSessionManager:
         Uses the configured default as a floor; bumps up for longer or
         more complex messages so Honcho applies more inference where it matters.
 
+        When dialectic_dynamic is False, always returns the configured
+        default — useful for cost control.
+
           < 120 chars  → default (typically "low")
           120–400 chars → one level above default (cap at "high")
           > 400 chars  → two levels above default (cap at "high")
@@ -464,6 +506,11 @@ class HonchoSessionManager:
         """
         levels = self._REASONING_LEVELS
         default_idx = levels.index(self._dialectic_reasoning_level) if self._dialectic_reasoning_level in levels else 1
+
+        # If dynamic bumping is disabled, return the static default
+        if not self._dialectic_dynamic:
+            return levels[default_idx]
+
         n = len(query)
         if n < 120:
             bump = 0
@@ -500,6 +547,11 @@ class HonchoSessionManager:
         session = self._cache.get(session_key)
         if not session:
             return ""
+
+        # Dialectic input guard — truncate long queries to avoid excessive cost
+        if len(query) > self._dialectic_max_input_chars:
+            query = query[:self._dialectic_max_input_chars]
+            logger.debug("Truncated dialectic query to %d chars", self._dialectic_max_input_chars)
 
         level = reasoning_level or self._dynamic_reasoning_level(query)
 
