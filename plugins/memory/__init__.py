@@ -5,8 +5,9 @@ Each subdirectory must contain ``__init__.py`` with a class implementing
 the MemoryProvider ABC.
 
 Memory providers are separate from the general plugin system — they live
-in the repo and are always available without user installation. Only ONE
-can be active at a time, selected via ``memory.provider`` in config.yaml.
+in the repo and are always available without user installation. Multiple
+providers can be active simultaneously via a comma-separated list in
+``memory.provider`` in config.yaml (e.g. ``honcho,hindsight``).
 
 Usage:
     from plugins.memory import discover_memory_providers, load_memory_provider
