@@ -2481,6 +2481,39 @@ class TestToolRepeatHint:
             agent._get_tool_repeat_hint(["execute_code"])  # complies
         assert any("tool_repeat_hint_complied" in r.message for r in caplog.records)
 
+    def test_persist_calls_session_db(self, agent):
+        """_persist_tool_repeat_hints writes counters to session DB when available."""
+        from unittest.mock import MagicMock
+        mock_db = MagicMock()
+        agent._session_db = mock_db
+        agent.session_id = "test-session-123"
+        agent._tool_repeat_hints_fired = 3
+        agent._tool_repeat_hints_complied = 2
+        agent._persist_tool_repeat_hints()
+        mock_db.update_tool_repeat_hints.assert_called_once_with(
+            "test-session-123", hints_fired=3, hints_complied=2,
+        )
+
+    def test_persist_skips_when_no_db(self, agent):
+        """_persist_tool_repeat_hints is a no-op without session DB."""
+        agent._session_db = None
+        agent._tool_repeat_hints_fired = 5
+        agent._tool_repeat_hints_complied = 3
+        # Should not raise
+        agent._persist_tool_repeat_hints()
+
+    def test_persist_swallows_exceptions(self, agent):
+        """_persist_tool_repeat_hints should never block the agent loop."""
+        from unittest.mock import MagicMock
+        mock_db = MagicMock()
+        mock_db.update_tool_repeat_hints.side_effect = RuntimeError("db locked")
+        agent._session_db = mock_db
+        agent.session_id = "test-session-123"
+        agent._tool_repeat_hints_fired = 1
+        agent._tool_repeat_hints_complied = 0
+        # Should not raise
+        agent._persist_tool_repeat_hints()
+
 
 class TestSafeWriter:
     """Verify _SafeWriter guards stdout against OSError (broken pipes)."""

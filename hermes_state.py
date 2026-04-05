@@ -32,7 +32,7 @@ T = TypeVar("T")
 
 DEFAULT_DB_PATH = get_hermes_home() / "state.db"
 
-SCHEMA_VERSION = 6
+SCHEMA_VERSION = 7
 
 SCHEMA_SQL = """
 CREATE TABLE IF NOT EXISTS schema_version (
@@ -66,6 +66,8 @@ CREATE TABLE IF NOT EXISTS sessions (
     cost_source TEXT,
     pricing_version TEXT,
     title TEXT,
+    tool_repeat_hints_fired INTEGER DEFAULT 0,
+    tool_repeat_hints_complied INTEGER DEFAULT 0,
     FOREIGN KEY (parent_session_id) REFERENCES sessions(id)
 );
 
@@ -330,6 +332,20 @@ class SessionDB:
                     except sqlite3.OperationalError:
                         pass  # Column already exists
                 cursor.execute("UPDATE schema_version SET version = 6")
+            if current_version < 7:
+                # v7: add tool-repeat hint observability columns to sessions
+                for col_name, col_type in [
+                    ("tool_repeat_hints_fired", "INTEGER DEFAULT 0"),
+                    ("tool_repeat_hints_complied", "INTEGER DEFAULT 0"),
+                ]:
+                    try:
+                        safe = col_name.replace('"', '""')
+                        cursor.execute(
+                            f'ALTER TABLE sessions ADD COLUMN "{safe}" {col_type}'
+                        )
+                    except sqlite3.OperationalError:
+                        pass  # Column already exists
+                cursor.execute("UPDATE schema_version SET version = 7")
 
         # Unique title index — always ensure it exists (safe to run after migrations
         # since the title column is guaranteed to exist at this point)
@@ -498,6 +514,27 @@ class SessionDB:
         )
         def _do(conn):
             conn.execute(sql, params)
+        self._execute_write(_do)
+
+    def update_tool_repeat_hints(
+        self,
+        session_id: str,
+        hints_fired: int,
+        hints_complied: int,
+    ) -> None:
+        """Persist tool-repeat hint counters (absolute values) for a session.
+
+        Called from the agent after each hint fire or compliance event so
+        that /insights can aggregate across sessions.
+        """
+        def _do(conn):
+            conn.execute(
+                """UPDATE sessions SET
+                   tool_repeat_hints_fired = ?,
+                   tool_repeat_hints_complied = ?
+                   WHERE id = ?""",
+                (hints_fired, hints_complied, session_id),
+            )
         self._execute_write(_do)
 
     def ensure_session(

@@ -716,3 +716,155 @@ class TestEdgeCases:
         # Depending on timing, might catch the session if created <1s ago
         # Just verify it doesn't crash
         assert "empty" in report
+
+
+# =========================================================================
+# Tool Repeat Hint Insights
+# =========================================================================
+
+class TestToolRepeatHintInsights:
+    """Tests for the tool-repeat hint observability pipeline: schema, persistence, insights."""
+
+    def test_schema_v7_adds_hint_columns(self, db):
+        """Schema migration v7 should add hint columns to sessions table."""
+        cursor = db._conn.execute("PRAGMA table_info(sessions)")
+        columns = {row["name"] for row in cursor.fetchall()}
+        assert "tool_repeat_hints_fired" in columns
+        assert "tool_repeat_hints_complied" in columns
+
+    def test_update_tool_repeat_hints(self, db):
+        """update_tool_repeat_hints should persist counters to the session row."""
+        db.create_session(session_id="s1", source="cli", model="test")
+        db.update_tool_repeat_hints("s1", hints_fired=5, hints_complied=3)
+        db._conn.commit()
+
+        row = db._conn.execute(
+            "SELECT tool_repeat_hints_fired, tool_repeat_hints_complied "
+            "FROM sessions WHERE id = 's1'"
+        ).fetchone()
+        assert row["tool_repeat_hints_fired"] == 5
+        assert row["tool_repeat_hints_complied"] == 3
+
+    def test_update_tool_repeat_hints_overwrites(self, db):
+        """Subsequent calls should overwrite (absolute), not increment."""
+        db.create_session(session_id="s1", source="cli", model="test")
+        db.update_tool_repeat_hints("s1", hints_fired=2, hints_complied=1)
+        db.update_tool_repeat_hints("s1", hints_fired=5, hints_complied=4)
+        db._conn.commit()
+
+        row = db._conn.execute(
+            "SELECT tool_repeat_hints_fired, tool_repeat_hints_complied "
+            "FROM sessions WHERE id = 's1'"
+        ).fetchone()
+        assert row["tool_repeat_hints_fired"] == 5
+        assert row["tool_repeat_hints_complied"] == 4
+
+    def test_default_hint_columns_are_zero(self, db):
+        """New sessions should default to 0 hints."""
+        db.create_session(session_id="s1", source="cli", model="test")
+        db._conn.commit()
+
+        row = db._conn.execute(
+            "SELECT tool_repeat_hints_fired, tool_repeat_hints_complied "
+            "FROM sessions WHERE id = 's1'"
+        ).fetchone()
+        assert row["tool_repeat_hints_fired"] == 0
+        assert row["tool_repeat_hints_complied"] == 0
+
+    def test_compute_tool_repeat_insights_no_hints(self, db):
+        """Sessions with zero hints should return zeros."""
+        db.create_session(session_id="s1", source="cli", model="test")
+        db._conn.commit()
+
+        engine = InsightsEngine(db)
+        report = engine.generate(days=30)
+        trh = report["tool_repeat_hints"]
+
+        assert trh["total_hints_fired"] == 0
+        assert trh["total_hints_complied"] == 0
+        assert trh["compliance_rate"] == 0.0
+        assert trh["sessions_with_hints"] == 0
+
+    def test_compute_tool_repeat_insights_with_data(self, db):
+        """Aggregation should sum across sessions and compute compliance rate."""
+        now = time.time()
+        db.create_session(session_id="s1", source="cli", model="test")
+        db.update_tool_repeat_hints("s1", hints_fired=4, hints_complied=3)
+        db.create_session(session_id="s2", source="cli", model="test")
+        db.update_tool_repeat_hints("s2", hints_fired=6, hints_complied=4)
+        db.create_session(session_id="s3", source="cli", model="test")
+        # s3 has no hints -- should not count in sessions_with_hints
+        db._conn.commit()
+
+        engine = InsightsEngine(db)
+        report = engine.generate(days=30)
+        trh = report["tool_repeat_hints"]
+
+        assert trh["total_hints_fired"] == 10
+        assert trh["total_hints_complied"] == 7
+        assert trh["compliance_rate"] == pytest.approx(70.0)
+        assert trh["sessions_with_hints"] == 2
+        assert trh["total_sessions"] == 3
+
+    def test_terminal_format_shows_hint_section(self, db):
+        """format_terminal should include the hint section when hints fired > 0."""
+        db.create_session(session_id="s1", source="cli", model="test")
+        db.update_tool_repeat_hints("s1", hints_fired=8, hints_complied=6)
+        db._conn.commit()
+
+        engine = InsightsEngine(db)
+        report = engine.generate(days=30)
+        text = engine.format_terminal(report)
+
+        assert "Tool Repeat Hints" in text
+        assert "Hints fired:" in text
+        assert "Hints complied:" in text
+        assert "Compliance rate:" in text
+
+    def test_terminal_format_hides_section_when_no_hints(self, db):
+        """format_terminal should not show the section when no hints fired."""
+        db.create_session(session_id="s1", source="cli", model="test")
+        db._conn.commit()
+
+        engine = InsightsEngine(db)
+        report = engine.generate(days=30)
+        text = engine.format_terminal(report)
+
+        assert "Tool Repeat Hints" not in text
+
+    def test_gateway_format_shows_hint_line(self, db):
+        """format_gateway should include a hint summary when hints fired > 0."""
+        db.create_session(session_id="s1", source="cli", model="test")
+        db.update_tool_repeat_hints("s1", hints_fired=10, hints_complied=7)
+        db._conn.commit()
+
+        engine = InsightsEngine(db)
+        report = engine.generate(days=30)
+        text = engine.format_gateway(report)
+
+        assert "Tool Repeat Hints" in text
+        assert "10 fired" in text
+        assert "7 complied" in text
+        assert "70%" in text
+
+    def test_gateway_format_hides_hints_when_none(self, db):
+        """format_gateway should not mention hints when none fired."""
+        db.create_session(session_id="s1", source="cli", model="test")
+        db._conn.commit()
+
+        engine = InsightsEngine(db)
+        report = engine.generate(days=30)
+        text = engine.format_gateway(report)
+
+        assert "Tool Repeat Hints" not in text
+
+    def test_generate_includes_tool_repeat_hints_key(self, populated_db):
+        """The generate() report should always include the tool_repeat_hints key."""
+        engine = InsightsEngine(populated_db)
+        report = engine.generate(days=30)
+        assert "tool_repeat_hints" in report
+
+    def test_session_cols_include_hint_columns(self):
+        """_SESSION_COLS should query the new columns."""
+        assert "tool_repeat_hints_fired" in InsightsEngine._SESSION_COLS
+        assert "tool_repeat_hints_complied" in InsightsEngine._SESSION_COLS

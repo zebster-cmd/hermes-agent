@@ -6051,6 +6051,7 @@ class AIAgent:
                     self._tool_repeat_hints_complied,
                     self._tool_repeat_hints_fired,
                 )
+                self._persist_tool_repeat_hints()
             self._tool_repeat_last_hinted_tool = None
 
         self._recent_tool_names.append(iteration_entry)
@@ -6103,6 +6104,7 @@ class AIAgent:
             self._tool_repeat_hints_fired,
             self._tool_repeat_hints_complied,
         )
+        self._persist_tool_repeat_hints()
 
         return (
             f"[Hint: You've called {last} {streak} times consecutively. "
@@ -6127,6 +6129,23 @@ class AIAgent:
                 messages[-1]["content"] = last_content + f"\n\n{repeat_hint}"
         except (json.JSONDecodeError, TypeError):
             messages[-1]["content"] = last_content + f"\n\n{repeat_hint}"
+
+    def _persist_tool_repeat_hints(self) -> None:
+        """Flush current hint counters to the session DB.
+
+        Called after each hint-fire or compliance event so /insights has
+        accurate data even if the session ends unexpectedly.  Uses absolute
+        writes (not increments) since the agent holds the authoritative totals.
+        """
+        if self._session_db and self.session_id:
+            try:
+                self._session_db.update_tool_repeat_hints(
+                    self.session_id,
+                    hints_fired=self._tool_repeat_hints_fired,
+                    hints_complied=self._tool_repeat_hints_complied,
+                )
+            except Exception:
+                pass  # never block the agent loop
 
     def _emit_context_pressure(self, compaction_progress: float, compressor) -> None:
         """Notify the user that context is approaching the compaction threshold.

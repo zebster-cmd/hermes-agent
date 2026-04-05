@@ -156,6 +156,7 @@ class InsightsEngine:
         tools = self._compute_tool_breakdown(tool_usage)
         activity = self._compute_activity_patterns(sessions)
         top_sessions = self._compute_top_sessions(sessions)
+        tool_repeat_hints = self._compute_tool_repeat_insights(sessions)
 
         return {
             "days": days,
@@ -168,6 +169,7 @@ class InsightsEngine:
             "tools": tools,
             "activity": activity,
             "top_sessions": top_sessions,
+            "tool_repeat_hints": tool_repeat_hints,
         }
 
     # =========================================================================
@@ -179,7 +181,8 @@ class InsightsEngine:
                      "message_count, tool_call_count, input_tokens, output_tokens, "
                      "cache_read_tokens, cache_write_tokens, billing_provider, "
                      "billing_base_url, billing_mode, estimated_cost_usd, "
-                     "actual_cost_usd, cost_status, cost_source")
+                     "actual_cost_usd, cost_status, cost_source, "
+                     "tool_repeat_hints_fired, tool_repeat_hints_complied")
 
     # Pre-computed query strings — f-string evaluated once at class definition,
     # not at runtime, so no user-controlled value can alter the query structure.
@@ -601,6 +604,36 @@ class InsightsEngine:
 
         return top
 
+    def _compute_tool_repeat_insights(self, sessions: List[Dict]) -> Dict:
+        """Aggregate tool-repeat hint observability across sessions.
+
+        Returns a dict with totals, compliance rate, and per-session breakdown
+        for sessions where at least one hint fired.
+        """
+        total_fired = 0
+        total_complied = 0
+        sessions_with_hints = 0
+
+        for s in sessions:
+            fired = s.get("tool_repeat_hints_fired") or 0
+            complied = s.get("tool_repeat_hints_complied") or 0
+            total_fired += fired
+            total_complied += complied
+            if fired > 0:
+                sessions_with_hints += 1
+
+        compliance_rate = (
+            (total_complied / total_fired * 100) if total_fired > 0 else 0.0
+        )
+
+        return {
+            "total_hints_fired": total_fired,
+            "total_hints_complied": total_complied,
+            "compliance_rate": compliance_rate,
+            "sessions_with_hints": sessions_with_hints,
+            "total_sessions": len(sessions),
+        }
+
     # =========================================================================
     # Formatting
     # =========================================================================
@@ -733,6 +766,20 @@ class InsightsEngine:
                 lines.append(f"  {ts['label']:<20} {ts['value']:<18} ({ts['date']}, {ts['session_id']})")
             lines.append("")
 
+        # Tool repeat hint observability
+        trh = report.get("tool_repeat_hints", {})
+        if trh.get("total_hints_fired", 0) > 0:
+            lines.append("  🔁 Tool Repeat Hints")
+            lines.append("  " + "─" * 56)
+            fired = trh["total_hints_fired"]
+            complied = trh["total_hints_complied"]
+            rate = trh["compliance_rate"]
+            sessions_with = trh["sessions_with_hints"]
+            total_sess = trh["total_sessions"]
+            lines.append(f"  Hints fired:       {fired:<12}  Hints complied:  {complied}")
+            lines.append(f"  Compliance rate:   {rate:<11.0f}%  Sessions w/hints: {sessions_with}/{total_sess}")
+            lines.append("")
+
         return "\n".join(lines)
 
     def format_gateway(self, report: Dict) -> str:
@@ -795,5 +842,18 @@ class InsightsEngine:
                 lines.append(f"**Active days:** {act['active_days']}", )
             if act.get("max_streak", 0) > 1:
                 lines.append(f"**Best streak:** {act['max_streak']} consecutive days")
+
+        # Tool repeat hints
+        trh = report.get("tool_repeat_hints", {})
+        if trh.get("total_hints_fired", 0) > 0:
+            fired = trh["total_hints_fired"]
+            complied = trh["total_hints_complied"]
+            rate = trh["compliance_rate"]
+            sessions_with = trh["sessions_with_hints"]
+            lines.append("")
+            lines.append(
+                f"**🔁 Tool Repeat Hints:** {fired} fired, {complied} complied "
+                f"({rate:.0f}% compliance across {sessions_with} sessions)"
+            )
 
         return "\n".join(lines)
