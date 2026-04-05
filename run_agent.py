@@ -1283,6 +1283,9 @@ class AIAgent:
 
         # Consecutive tool-call tracker for batching hints
         self._recent_tool_names: list = []
+        self._tool_repeat_hints_fired: int = 0
+        self._tool_repeat_hints_complied: int = 0
+        self._tool_repeat_last_hinted_tool: Optional[str] = None
 
         # Context compressor internal counters (if present)
         if hasattr(self, "context_compressor") and self.context_compressor:
@@ -5663,18 +5666,7 @@ class AIAgent:
 
         # ── Tool-repeat batching hint ─────────────────────────────────────
         iteration_tool_names = [r[0] for r in results if r is not None]
-        repeat_hint = self._get_tool_repeat_hint(iteration_tool_names)
-        if repeat_hint and messages and messages[-1].get("role") == "tool":
-            last_content = messages[-1]["content"]
-            try:
-                parsed = json.loads(last_content)
-                if isinstance(parsed, dict):
-                    parsed["_tool_repeat_hint"] = repeat_hint
-                    messages[-1]["content"] = json.dumps(parsed, ensure_ascii=False)
-                else:
-                    messages[-1]["content"] = last_content + f"\n\n{repeat_hint}"
-            except (json.JSONDecodeError, TypeError):
-                messages[-1]["content"] = last_content + f"\n\n{repeat_hint}"
+        self._inject_tool_repeat_hint(iteration_tool_names, messages)
 
     def _execute_tool_calls_sequential(self, assistant_message, messages: list, effective_task_id: str, api_call_count: int = 0) -> None:
         """Execute tool calls sequentially (original behavior). Used for single calls or interactive tools."""
@@ -5990,18 +5982,7 @@ class AIAgent:
         iteration_tool_names = [
             tc.function.name for tc in assistant_message.tool_calls
         ]
-        repeat_hint = self._get_tool_repeat_hint(iteration_tool_names)
-        if repeat_hint and messages and messages[-1].get("role") == "tool":
-            last_content = messages[-1]["content"]
-            try:
-                parsed = json.loads(last_content)
-                if isinstance(parsed, dict):
-                    parsed["_tool_repeat_hint"] = repeat_hint
-                    messages[-1]["content"] = json.dumps(parsed, ensure_ascii=False)
-                else:
-                    messages[-1]["content"] = last_content + f"\n\n{repeat_hint}"
-            except (json.JSONDecodeError, TypeError):
-                messages[-1]["content"] = last_content + f"\n\n{repeat_hint}"
+        self._inject_tool_repeat_hint(iteration_tool_names, messages)
 
     def _get_budget_warning(self, api_call_count: int) -> Optional[str]:
         """Return a budget pressure string, or None if not yet needed.
@@ -6030,23 +6011,61 @@ class AIAgent:
     def _get_tool_repeat_hint(self, tool_names: list) -> Optional[str]:
         """Return a batching hint if recent tool calls show a consecutive same-tool streak.
 
-        Appends *tool_names* (from the current iteration) to the running
-        tracker ``_recent_tool_names`` and checks whether the tail forms a
-        streak of ``_TOOL_REPEAT_THRESHOLD`` or more identical calls to a
-        tool.  Returns a ``[Hint: ...]`` string or ``None``.
+        Receives *tool_names* from the current iteration (one API round-trip)
+        and records it as a single entry in ``_recent_tool_names``.  When a
+        model batches multiple calls of the same tool into one response (e.g.
+        3x ``read_file`` in parallel), that counts as **one** iteration — the
+        efficient behaviour we want to encourage, not penalise.
+
+        The streak is measured in *iterations*, not individual tool calls.
+        A hint fires only when ``_TOOL_REPEAT_THRESHOLD`` consecutive
+        iterations each used exactly one distinct tool and it was the same
+        tool every time.
+
+        Also tracks compliance: if a hint was fired on the previous iteration
+        and the model switched to a different tool, that counts as compliance.
         """
         if not hasattr(self, "_recent_tool_names"):
             self._recent_tool_names = []
-        self._recent_tool_names.extend(tool_names)
+        if not hasattr(self, "_tool_repeat_hints_fired"):
+            self._tool_repeat_hints_fired = 0
+            self._tool_repeat_hints_complied = 0
+            self._tool_repeat_last_hinted_tool = None
+
+        # Collapse this iteration to its unique tool set.  If the model
+        # issued multiple calls of the same tool in one response (parallel
+        # batching) that is a *single* iteration entry, not N entries.
+        # Mixed-tool iterations break any streak (recorded as None).
+        unique_tools = set(tool_names) if tool_names else set()
+        iteration_entry = unique_tools.pop() if len(unique_tools) == 1 else None
+
+        # ── Compliance check: did the model follow the previous hint? ─────
+        if self._tool_repeat_last_hinted_tool and tool_names:
+            if iteration_entry != self._tool_repeat_last_hinted_tool:
+                self._tool_repeat_hints_complied += 1
+                logger.info(
+                    "tool_repeat_hint_complied: model switched from %s to %s "
+                    "(compliance: %d/%d)",
+                    self._tool_repeat_last_hinted_tool,
+                    tool_names[0],
+                    self._tool_repeat_hints_complied,
+                    self._tool_repeat_hints_fired,
+                )
+            self._tool_repeat_last_hinted_tool = None
+
+        self._recent_tool_names.append(iteration_entry)
 
         if len(self._recent_tool_names) < _TOOL_REPEAT_THRESHOLD:
             return None
 
-        # Count the trailing streak of the same tool name
+        # Count the trailing streak of identical iteration entries.
+        # None entries (mixed-tool iterations) never form a streak.
         last = self._recent_tool_names[-1]
+        if last is None:
+            return None
         streak = 0
-        for name in reversed(self._recent_tool_names):
-            if name == last:
+        for entry in reversed(self._recent_tool_names):
+            if entry == last:
                 streak += 1
             else:
                 break
@@ -6075,10 +6094,39 @@ class AIAgent:
                 "iterations — use execute_code or combine operations where possible."
             )
 
+        self._tool_repeat_hints_fired += 1
+        self._tool_repeat_last_hinted_tool = last
+        logger.info(
+            "tool_repeat_hint_fired: tool=%s streak=%d threshold=%d "
+            "total_hints=%d total_complied=%d",
+            last, streak, _TOOL_REPEAT_THRESHOLD,
+            self._tool_repeat_hints_fired,
+            self._tool_repeat_hints_complied,
+        )
+
         return (
             f"[Hint: You've called {last} {streak} times consecutively. "
             f"{advice}]"
         )
+    def _inject_tool_repeat_hint(self, iteration_tool_names: list, messages: list) -> None:
+        """Generate and inject a tool-repeat batching hint into the last tool message.
+
+        Shared by both ``_execute_tool_calls_concurrent`` and
+        ``_execute_tool_calls_sequential`` to avoid duplicated injection logic.
+        """
+        repeat_hint = self._get_tool_repeat_hint(iteration_tool_names)
+        if not repeat_hint or not messages or messages[-1].get("role") != "tool":
+            return
+        last_content = messages[-1]["content"]
+        try:
+            parsed = json.loads(last_content)
+            if isinstance(parsed, dict):
+                parsed["_tool_repeat_hint"] = repeat_hint
+                messages[-1]["content"] = json.dumps(parsed, ensure_ascii=False)
+            else:
+                messages[-1]["content"] = last_content + f"\n\n{repeat_hint}"
+        except (json.JSONDecodeError, TypeError):
+            messages[-1]["content"] = last_content + f"\n\n{repeat_hint}"
 
     def _emit_context_pressure(self, compaction_progress: float, compressor) -> None:
         """Notify the user that context is approaching the compaction threshold.
@@ -8343,6 +8391,8 @@ class AIAgent:
             "estimated_cost_usd": self.session_estimated_cost_usd,
             "cost_status": self.session_cost_status,
             "cost_source": self.session_cost_source,
+            "tool_repeat_hints_fired": getattr(self, "_tool_repeat_hints_fired", 0),
+            "tool_repeat_hints_complied": getattr(self, "_tool_repeat_hints_complied", 0),
         }
         self._response_was_previewed = False
         

@@ -2263,14 +2263,31 @@ class TestBudgetPressure:
 
 
 class TestToolRepeatHint:
-    """Tool-repeat batching hints (consecutive same-tool detection)."""
+    """Tool-repeat batching hints (consecutive same-tool detection).
+
+    The streak counter works at the *iteration* level (one API round-trip),
+    not individual tool calls.  When a model batches 3x read_file in a single
+    response, that counts as one iteration — the efficient behaviour we want.
+    """
+
+    @pytest.fixture(autouse=True)
+    def _reset_hint_state(self, agent):
+        """Zero out all hint-tracking state before each test."""
+        agent._recent_tool_names = []
+        agent._tool_repeat_hints_fired = 0
+        agent._tool_repeat_hints_complied = 0
+        agent._tool_repeat_last_hinted_tool = None
+
+    # ── Core streak detection ────────────────────────────────────────────
 
     def test_no_hint_below_threshold(self, agent):
-        agent._recent_tool_names = []
-        assert agent._get_tool_repeat_hint(["terminal", "read_file"]) is None
+        """Two iterations of the same tool is below threshold (3)."""
+        assert agent._get_tool_repeat_hint(["terminal"]) is None
+        assert agent._get_tool_repeat_hint(["terminal"]) is None
 
     def test_hint_at_threshold(self, agent):
-        agent._recent_tool_names = ["terminal", "terminal"]
+        agent._get_tool_repeat_hint(["terminal"])
+        agent._get_tool_repeat_hint(["terminal"])
         hint = agent._get_tool_repeat_hint(["terminal"])
         assert hint is not None
         assert "terminal" in hint
@@ -2278,40 +2295,78 @@ class TestToolRepeatHint:
         assert "&&" in hint  # terminal-specific advice
 
     def test_hint_longer_streak(self, agent):
-        agent._recent_tool_names = ["terminal"] * 4
+        for _ in range(4):
+            agent._get_tool_repeat_hint(["terminal"])
         hint = agent._get_tool_repeat_hint(["terminal"])
         assert "5 times" in hint
 
     def test_hint_for_any_tool(self, agent):
         """Hints fire for any tool, not just a hardcoded set."""
-        agent._recent_tool_names = ["browser_click", "browser_click"]
+        for _ in range(2):
+            agent._get_tool_repeat_hint(["browser_click"])
         hint = agent._get_tool_repeat_hint(["browser_click"])
         assert hint is not None
         assert "browser_click" in hint
         assert "consolidated" in hint
 
     def test_read_file_specific_advice(self, agent):
-        agent._recent_tool_names = ["read_file", "read_file"]
+        for _ in range(2):
+            agent._get_tool_repeat_hint(["read_file"])
         hint = agent._get_tool_repeat_hint(["read_file"])
         assert "execute_code" in hint
         assert "consolidated summary" in hint
 
     def test_patch_specific_advice(self, agent):
-        agent._recent_tool_names = ["patch", "patch"]
+        for _ in range(2):
+            agent._get_tool_repeat_hint(["patch"])
         hint = agent._get_tool_repeat_hint(["patch"])
         assert "V4A" in hint
 
     def test_streak_broken_by_different_tool(self, agent):
-        agent._recent_tool_names = ["terminal", "terminal", "read_file"]
+        """A different tool in between resets the streak."""
+        agent._get_tool_repeat_hint(["terminal"])
+        agent._get_tool_repeat_hint(["terminal"])
+        agent._get_tool_repeat_hint(["read_file"])  # breaks streak
         assert agent._get_tool_repeat_hint(["terminal"]) is None
 
     def test_accumulates_across_iterations(self, agent):
-        agent._recent_tool_names = []
         assert agent._get_tool_repeat_hint(["terminal"]) is None
         assert agent._get_tool_repeat_hint(["terminal"]) is None
         hint = agent._get_tool_repeat_hint(["terminal"])
         assert hint is not None
         assert "3 times" in hint
+
+    # ── Parallel tool call awareness ─────────────────────────────────────
+
+    def test_parallel_same_tool_counts_as_one_iteration(self, agent):
+        """3x read_file in ONE response is already batched — no hint."""
+        # Single iteration with 3 parallel read_file calls
+        assert agent._get_tool_repeat_hint(["read_file", "read_file", "read_file"]) is None
+        # Still only 1 iteration recorded
+        assert len(agent._recent_tool_names) == 1
+
+    def test_parallel_same_tool_across_iterations_triggers(self, agent):
+        """3 separate iterations each with parallel read_file calls should trigger."""
+        agent._get_tool_repeat_hint(["read_file", "read_file"])
+        agent._get_tool_repeat_hint(["read_file", "read_file", "read_file"])
+        hint = agent._get_tool_repeat_hint(["read_file"])
+        assert hint is not None
+        assert "3 times" in hint
+
+    def test_mixed_tool_iteration_breaks_streak(self, agent):
+        """An iteration with different tools (e.g. read_file + terminal) breaks any streak."""
+        agent._get_tool_repeat_hint(["terminal"])
+        agent._get_tool_repeat_hint(["terminal"])
+        agent._get_tool_repeat_hint(["terminal", "read_file"])  # mixed — breaks streak
+        assert agent._get_tool_repeat_hint(["terminal"]) is None
+
+    def test_mixed_tool_iteration_does_not_form_streak(self, agent):
+        """Mixed-tool iterations never accumulate into a streak themselves."""
+        agent._get_tool_repeat_hint(["terminal", "read_file"])
+        agent._get_tool_repeat_hint(["terminal", "read_file"])
+        assert agent._get_tool_repeat_hint(["terminal", "read_file"]) is None
+
+    # ── History stripping ────────────────────────────────────────────────
 
     def test_strip_from_json_history(self):
         import json
@@ -2332,6 +2387,99 @@ class TestToolRepeatHint:
         _strip_tool_repeat_hints_from_history(messages)
         assert "execute_code" not in messages[0]["content"]
         assert "some result" in messages[0]["content"]
+
+    # ── Observability: compliance tracking, logging, injection helper ──
+
+    def test_fired_counter_increments(self, agent):
+        """_tool_repeat_hints_fired increments each time a hint is generated."""
+        agent._get_tool_repeat_hint(["terminal"])
+        agent._get_tool_repeat_hint(["terminal"])
+        agent._get_tool_repeat_hint(["terminal"])
+        assert agent._tool_repeat_hints_fired == 1
+        agent._get_tool_repeat_hint(["terminal"])
+        assert agent._tool_repeat_hints_fired == 2
+
+    def test_compliance_detected_on_tool_switch(self, agent):
+        """Compliance counted when model switches tool after a hint."""
+        agent._get_tool_repeat_hint(["terminal"])
+        agent._get_tool_repeat_hint(["terminal"])
+        hint = agent._get_tool_repeat_hint(["terminal"])
+        assert hint is not None
+        assert agent._tool_repeat_last_hinted_tool == "terminal"
+        agent._get_tool_repeat_hint(["execute_code"])
+        assert agent._tool_repeat_hints_complied == 1
+
+    def test_no_compliance_when_same_tool_continues(self, agent):
+        """No compliance credit when model ignores the hint."""
+        agent._get_tool_repeat_hint(["terminal"])
+        agent._get_tool_repeat_hint(["terminal"])
+        agent._get_tool_repeat_hint(["terminal"])
+        agent._get_tool_repeat_hint(["terminal"])
+        assert agent._tool_repeat_hints_complied == 0
+
+    def test_compliance_resets_last_hinted_tool(self, agent):
+        """After compliance check, _tool_repeat_last_hinted_tool is cleared."""
+        agent._get_tool_repeat_hint(["terminal"])
+        agent._get_tool_repeat_hint(["terminal"])
+        agent._get_tool_repeat_hint(["terminal"])
+        assert agent._tool_repeat_last_hinted_tool == "terminal"
+        agent._get_tool_repeat_hint(["execute_code"])
+        assert agent._tool_repeat_last_hinted_tool is None
+
+    def test_inject_hint_json(self, agent):
+        """_inject_tool_repeat_hint adds hint to JSON tool messages."""
+        import json
+        agent._recent_tool_names = ["terminal", "terminal"]
+        messages = [{"role": "tool", "content": json.dumps({"output": "ok"}), "tool_call_id": "tc1"}]
+        agent._inject_tool_repeat_hint(["terminal"], messages)
+        parsed = json.loads(messages[0]["content"])
+        assert "_tool_repeat_hint" in parsed
+        assert "terminal" in parsed["_tool_repeat_hint"]
+
+    def test_inject_hint_plaintext(self, agent):
+        """_inject_tool_repeat_hint appends hint to plaintext tool messages."""
+        agent._recent_tool_names = ["terminal", "terminal"]
+        messages = [{"role": "tool", "content": "plain output", "tool_call_id": "tc1"}]
+        agent._inject_tool_repeat_hint(["terminal"], messages)
+        assert "[Hint:" in messages[0]["content"]
+        assert "plain output" in messages[0]["content"]
+
+    def test_inject_noop_below_threshold(self, agent):
+        """_inject_tool_repeat_hint is a no-op when streak is below threshold."""
+        messages = [{"role": "tool", "content": "output", "tool_call_id": "tc1"}]
+        agent._inject_tool_repeat_hint(["terminal"], messages)
+        assert "[Hint:" not in messages[0]["content"]
+
+    def test_counters_cleared_by_reset_session_state(self, agent):
+        """reset_session_state clears all hint tracking counters."""
+        agent._tool_repeat_hints_fired = 5
+        agent._tool_repeat_hints_complied = 3
+        agent._tool_repeat_last_hinted_tool = "terminal"
+        agent._recent_tool_names = ["terminal"] * 10
+        agent.reset_session_state()
+        assert agent._tool_repeat_hints_fired == 0
+        assert agent._tool_repeat_hints_complied == 0
+        assert agent._tool_repeat_last_hinted_tool is None
+        assert agent._recent_tool_names == []
+
+    def test_logging_on_fire(self, agent, caplog):
+        """logger.info is called when a hint fires."""
+        import logging
+        agent._get_tool_repeat_hint(["terminal"])
+        agent._get_tool_repeat_hint(["terminal"])
+        with caplog.at_level(logging.INFO, logger="run_agent"):
+            agent._get_tool_repeat_hint(["terminal"])
+        assert any("tool_repeat_hint_fired" in r.message for r in caplog.records)
+
+    def test_logging_on_compliance(self, agent, caplog):
+        """logger.info is called when compliance is detected."""
+        import logging
+        agent._get_tool_repeat_hint(["terminal"])
+        agent._get_tool_repeat_hint(["terminal"])
+        agent._get_tool_repeat_hint(["terminal"])  # fires hint
+        with caplog.at_level(logging.INFO, logger="run_agent"):
+            agent._get_tool_repeat_hint(["execute_code"])  # complies
+        assert any("tool_repeat_hint_complied" in r.message for r in caplog.records)
 
 
 class TestSafeWriter:
