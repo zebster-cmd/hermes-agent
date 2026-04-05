@@ -1002,16 +1002,19 @@ class TestExecuteToolCalls:
         assert messages[0]["role"] == "tool"
         assert messages[0]["tool_call_id"] == "c1"
 
-    def test_result_truncation_over_100k(self, agent):
+    def test_result_truncation_over_100k(self, agent, tmp_path, monkeypatch):
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path / ".hermes"))
+        (tmp_path / ".hermes").mkdir()
         tc = _mock_tool_call(name="web_search", arguments="{}", call_id="c1")
         mock_msg = _mock_assistant_msg(content="", tool_calls=[tc])
         messages = []
         big_result = "x" * 150_000
         with patch("run_agent.handle_function_call", return_value=big_result):
             agent._execute_tool_calls(mock_msg, messages, "task-1")
-        # Content should be truncated
+        # Content should be replaced with preview + file path
         assert len(messages[0]["content"]) < 150_000
-        assert "Truncated" in messages[0]["content"]
+        assert "Large tool response" in messages[0]["content"]
+        assert "Full output saved to:" in messages[0]["content"]
 
 
 class TestConcurrentToolExecution:
@@ -1230,8 +1233,10 @@ class TestConcurrentToolExecution:
         assert "cancelled" in messages[0]["content"].lower() or "skipped" in messages[0]["content"].lower()
         assert "cancelled" in messages[1]["content"].lower() or "skipped" in messages[1]["content"].lower()
 
-    def test_concurrent_truncates_large_results(self, agent):
-        """Concurrent path should truncate results over 100k chars."""
+    def test_concurrent_truncates_large_results(self, agent, tmp_path, monkeypatch):
+        """Concurrent path should save oversized results to file."""
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path / ".hermes"))
+        (tmp_path / ".hermes").mkdir()
         tc1 = _mock_tool_call(name="web_search", arguments='{}', call_id="c1")
         tc2 = _mock_tool_call(name="web_search", arguments='{}', call_id="c2")
         mock_msg = _mock_assistant_msg(content="", tool_calls=[tc1, tc2])
@@ -1244,7 +1249,8 @@ class TestConcurrentToolExecution:
         assert len(messages) == 2
         for m in messages:
             assert len(m["content"]) < 150_000
-            assert "Truncated" in m["content"]
+            assert "Large tool response" in m["content"]
+            assert "Full output saved to:" in m["content"]
 
     def test_invoke_tool_dispatches_to_handle_function_call(self, agent):
         """_invoke_tool should route regular tools through handle_function_call."""
@@ -1956,8 +1962,9 @@ class TestCredentialPoolRecovery:
             def current(self):
                 return current
 
-            def mark_exhausted_and_rotate(self, *, status_code):
+            def mark_exhausted_and_rotate(self, *, status_code, error_context=None):
                 assert status_code == 402
+                assert error_context is None
                 return next_entry
 
         agent._credential_pool = _Pool()
@@ -1979,8 +1986,9 @@ class TestCredentialPoolRecovery:
             def current(self):
                 return SimpleNamespace(label="primary")
 
-            def mark_exhausted_and_rotate(self, *, status_code):
+            def mark_exhausted_and_rotate(self, *, status_code, error_context=None):
                 assert status_code == 429
+                assert error_context is None
                 return next_entry
 
         agent._credential_pool = _Pool()
@@ -2030,8 +2038,9 @@ class TestCredentialPoolRecovery:
             def try_refresh_current(self):
                 return None  # refresh failed
 
-            def mark_exhausted_and_rotate(self, *, status_code):
+            def mark_exhausted_and_rotate(self, *, status_code, error_context=None):
                 assert status_code == 401
+                assert error_context is None
                 return next_entry
 
         agent._credential_pool = _Pool()
@@ -2053,7 +2062,8 @@ class TestCredentialPoolRecovery:
             def try_refresh_current(self):
                 return None
 
-            def mark_exhausted_and_rotate(self, *, status_code):
+            def mark_exhausted_and_rotate(self, *, status_code, error_context=None):
+                assert error_context is None
                 return None  # no more credentials
 
         agent._credential_pool = _Pool()
@@ -2066,6 +2076,52 @@ class TestCredentialPoolRecovery:
 
         assert recovered is False
         agent._swap_credential.assert_not_called()
+
+    def test_extract_api_error_context_uses_reset_timestamp_and_reason(self, agent):
+        response = SimpleNamespace(headers={})
+        error = SimpleNamespace(
+            body={
+                "error": {
+                    "code": "device_code_exhausted",
+                    "message": "Weekly credits exhausted.",
+                    "resets_at": "2026-04-12T10:30:00Z",
+                }
+            },
+            response=response,
+        )
+
+        context = agent._extract_api_error_context(error)
+
+        assert context["reason"] == "device_code_exhausted"
+        assert context["message"] == "Weekly credits exhausted."
+        assert context["reset_at"] == "2026-04-12T10:30:00Z"
+
+    def test_recover_with_pool_passes_error_context_on_rotated_429(self, agent):
+        next_entry = SimpleNamespace(label="secondary")
+        captured = {}
+
+        class _Pool:
+            def current(self):
+                return SimpleNamespace(label="primary")
+
+            def mark_exhausted_and_rotate(self, *, status_code, error_context=None):
+                captured["status_code"] = status_code
+                captured["error_context"] = error_context
+                return next_entry
+
+        agent._credential_pool = _Pool()
+        agent._swap_credential = MagicMock()
+
+        recovered, retry_same = agent._recover_with_credential_pool(
+            status_code=429,
+            has_retried_429=True,
+            error_context={"reason": "device_code_exhausted", "reset_at": "2026-04-12T10:30:00Z"},
+        )
+
+        assert recovered is True
+        assert retry_same is False
+        assert captured["status_code"] == 429
+        assert captured["error_context"]["reason"] == "device_code_exhausted"
 
 
 class TestMaxTokensParam:
