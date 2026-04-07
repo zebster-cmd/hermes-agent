@@ -77,6 +77,27 @@ def resolve_config_path() -> Path:
 
 _RECALL_MODE_ALIASES = {"auto": "hybrid"}
 _VALID_RECALL_MODES = {"hybrid", "context", "tools"}
+_BASE_URL_KEYS = ("baseUrl", "base_url", "baseURL")
+
+
+def _resolve_base_url(*sources: dict[str, Any] | None) -> str | None:
+    """Resolve base_url from one or more config dicts plus env fallback.
+
+    Resolution order follows the given source order, then HONCHO_BASE_URL.
+    Prefers canonical camelCase `baseUrl`, while accepting `base_url`
+    and `baseURL` as compatibility aliases.
+    """
+    for source in sources:
+        if not isinstance(source, dict):
+            continue
+        for key in _BASE_URL_KEYS:
+            value = source.get(key)
+            if isinstance(value, str):
+                stripped = value.strip()
+                if stripped:
+                    return stripped
+    env_value = os.environ.get("HONCHO_BASE_URL", "").strip()
+    return env_value or None
 
 
 def _bool_opt(host_block: dict, raw: dict, key: str, default: bool) -> bool:
@@ -312,12 +333,7 @@ class HonchoClientConfig:
             or raw.get("environment", "production")
         )
 
-        base_url = (
-            raw.get("baseUrl")
-            or raw.get("base_url")
-            or os.environ.get("HONCHO_BASE_URL", "").strip()
-            or None
-        )
+        base_url = _resolve_base_url(host_block, raw)
 
         # Auto-enable when API key or base_url is present (unless explicitly disabled)
         # Host-level enabled wins, then root-level, then auto-enable if key/url exists.
@@ -568,7 +584,7 @@ def get_honcho_client(config: HonchoClientConfig | None = None) -> Honcho:
             hermes_cfg = load_config()
             honcho_cfg = hermes_cfg.get("honcho", {})
             if isinstance(honcho_cfg, dict):
-                resolved_base_url = honcho_cfg.get("base_url", "").strip() or None
+                resolved_base_url = _resolve_base_url(honcho_cfg)
         except Exception:
             pass
 
