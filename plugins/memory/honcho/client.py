@@ -79,6 +79,18 @@ _RECALL_MODE_ALIASES = {"auto": "hybrid"}
 _VALID_RECALL_MODES = {"hybrid", "context", "tools"}
 
 
+def _bool_opt(host_block: dict, raw: dict, key: str, default: bool) -> bool:
+    """Resolve a boolean config option with host-level override."""
+    val = host_block.get(key)
+    if val is None:
+        val = raw.get(key)
+    if val is None:
+        return default
+    if isinstance(val, bool):
+        return val
+    return str(val).strip().lower() in ("true", "1", "yes", "on")
+
+
 def _normalize_recall_mode(val: str) -> str:
     """Normalize legacy recall mode values (e.g. 'auto' → 'hybrid')."""
     val = _RECALL_MODE_ALIASES.get(val, val)
@@ -173,12 +185,33 @@ class HonchoClientConfig:
     # Dialectic (peer.chat) settings
     # reasoning_level: "minimal" | "low" | "medium" | "high" | "max"
     dialectic_reasoning_level: str = "low"
+    # Ceiling for auto-bump. When equal to dialectic_reasoning_level, auto-bump
+    # is disabled. Set higher to allow dynamic escalation up to the cap.
+    dialectic_reasoning_cap: str = "low"
     # dynamic: auto-bump reasoning level based on query length
-    #   true  — low->medium (120+ chars), low->high (400+ chars), capped at "high"
+    #   true  — low->medium (120+ chars), low->high (400+ chars), capped at cap
     #   false — always use dialecticReasoningLevel as-is
     dialectic_dynamic: bool = True
     # Max chars of dialectic result to inject into Hermes system prompt
     dialectic_max_chars: int = 600
+    # Prefetch cadence: which components to fetch and how often.
+    # "first-turn" = session start only (default, cost-efficient).
+    # "every-turn" = unconditional per-turn fetch (legacy behavior).
+    # Integer N = every N turns.
+    dialectic_cadence: str | int = "first-turn"
+    context_cadence: str | int = "first-turn"
+    # Injection frequency: how many turns the cached Honcho context stays in
+    # the system prompt. Controls LLM input token cost.
+    # "first-turn" = inject on turn 0 only (model absorbs it, then it's dropped)
+    # "every-turn" = always inject (legacy behavior, costs tokens every turn)
+    # Integer N = inject for the first N turns, then suppress
+    injection_frequency: str | int = "every-turn"
+    # Per-component injection toggles
+    inject_representation: bool = True
+    inject_card: bool = True
+    inject_ai_representation: bool = False
+    inject_ai_card: bool = False
+    inject_dialectic: bool = True
     # Honcho API limits — configurable for self-hosted instances
     # Max chars per message sent via add_messages() (Honcho cloud: 25000)
     message_max_chars: int = 25000
@@ -341,6 +374,13 @@ class HonchoClientConfig:
                 or raw.get("dialecticReasoningLevel")
                 or "low"
             ),
+            dialectic_reasoning_cap=(
+                host_block.get("dialecticReasoningCap")
+                or raw.get("dialecticReasoningCap")
+                or host_block.get("dialecticReasoningLevel")
+                or raw.get("dialecticReasoningLevel")
+                or "low"
+            ),
             dialectic_dynamic=_resolve_bool(
                 host_block.get("dialecticDynamic"),
                 raw.get("dialecticDynamic"),
@@ -361,6 +401,26 @@ class HonchoClientConfig:
                 or raw.get("dialecticMaxInputChars")
                 or 10000
             ),
+            dialectic_cadence=(
+                host_block.get("dialecticCadence")
+                or raw.get("dialecticCadence")
+                or "first-turn"
+            ),
+            context_cadence=(
+                host_block.get("contextCadence")
+                or raw.get("contextCadence")
+                or "first-turn"
+            ),
+            injection_frequency=(
+                host_block.get("injectionFrequency")
+                or raw.get("injectionFrequency")
+                or "every-turn"
+            ),
+            inject_representation=_bool_opt(host_block, raw, "injectRepresentation", True),
+            inject_card=_bool_opt(host_block, raw, "injectCard", True),
+            inject_ai_representation=_bool_opt(host_block, raw, "injectAiRepresentation", False),
+            inject_ai_card=_bool_opt(host_block, raw, "injectAiCard", False),
+            inject_dialectic=_bool_opt(host_block, raw, "injectDialectic", True),
             recall_mode=_normalize_recall_mode(
                 host_block.get("recallMode")
                 or raw.get("recallMode")

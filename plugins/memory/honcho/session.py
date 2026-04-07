@@ -107,12 +107,18 @@ class HonchoSessionManager:
         self._dialectic_reasoning_level: str = (
             config.dialectic_reasoning_level if config else "low"
         )
+        self._dialectic_reasoning_cap: str = (
+            config.dialectic_reasoning_cap if config else "low"
+        )
         self._dialectic_dynamic: bool = (
             config.dialectic_dynamic if config else True
         )
         self._dialectic_max_chars: int = (
             config.dialectic_max_chars if config else 600
         )
+        self._dialectic_cadence = config.dialectic_cadence if config else "first-turn"
+        self._context_cadence = config.context_cadence if config else "first-turn"
+        self._turn_counts: dict[str, int] = {}  # session_key → turn number
         self._observation_mode: str = (
             config.observation_mode if config else "directional"
         )
@@ -513,8 +519,9 @@ class HonchoSessionManager:
             bump = 1
         else:
             bump = 2
-        # Cap at "high" (index 3) for auto-selection
-        idx = min(default_idx + bump, 3)
+        # Cap at configured ceiling (default: same as floor = no bump)
+        cap_idx = levels.index(self._dialectic_reasoning_cap) if self._dialectic_reasoning_cap in levels else default_idx
+        idx = min(default_idx + bump, cap_idx)
         return levels[idx]
 
     def dialectic_query(
@@ -576,6 +583,28 @@ class HonchoSessionManager:
             logger.warning("Honcho dialectic query failed: %s", e)
             return ""
 
+    def _should_prefetch(self, session_key: str, cadence: str | int) -> bool:
+        """Check whether a prefetch should fire based on cadence config.
+
+        Cadence values:
+          "first-turn"  — only on turn 0 (session start)
+          "every-turn"  — unconditional (legacy behavior)
+          int N          — every N turns (0 = first-turn only)
+        """
+        turn = self._turn_counts.get(session_key, 0)
+        if cadence == "every-turn":
+            return True
+        if cadence == "first-turn" or cadence == 0:
+            return turn == 0
+        if isinstance(cadence, int) and cadence > 0:
+            return turn % cadence == 0
+        # Unknown cadence string — treat as first-turn
+        return turn == 0
+
+    def increment_turn(self, session_key: str) -> None:
+        """Advance the turn counter for cadence tracking."""
+        self._turn_counts[session_key] = self._turn_counts.get(session_key, 0) + 1
+
     def prefetch_dialectic(self, session_key: str, query: str) -> None:
         """
         Fire a dialectic_query in a background thread, caching the result.
@@ -584,10 +613,15 @@ class HonchoSessionManager:
         on the next call (typically the following turn). Reasoning level
         is selected dynamically based on query complexity.
 
+        Respects dialectic_cadence: skips the call when cadence says
+        this turn doesn't need it.
+
         Args:
             session_key: The session key to query against.
             query: The user's current message, used as the query.
         """
+        if not self._should_prefetch(session_key, self._dialectic_cadence):
+            return
         def _run():
             result = self.dialectic_query(session_key, query)
             if result:
@@ -618,7 +652,12 @@ class HonchoSessionManager:
 
         Non-blocking. Consumed next turn via pop_context_result(). This avoids
         a synchronous HTTP round-trip blocking every response.
+
+        Respects context_cadence: skips the call when cadence says this turn
+        doesn't need it.
         """
+        if not self._should_prefetch(session_key, self._context_cadence):
+            return
         def _run():
             result = self.get_prefetch_context(session_key, user_message)
             if result:

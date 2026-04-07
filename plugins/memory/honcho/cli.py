@@ -595,6 +595,24 @@ def cmd_status(args) -> None:
     print(f"  Observation:    user(me={hcfg.user_observe_me},others={hcfg.user_observe_others}) ai(me={hcfg.ai_observe_me},others={hcfg.ai_observe_others})")
     print(f"  Write freq:     {hcfg.write_frequency}")
 
+    # Prefetch cadence
+    print(f"\n  Context cadence:   {hcfg.context_cadence}")
+    print(f"  Dialectic cadence: {hcfg.dialectic_cadence}")
+
+    # Injection toggles
+    _inj = []
+    if hcfg.inject_representation: _inj.append("representation")
+    if hcfg.inject_card: _inj.append("card")
+    if hcfg.inject_ai_representation: _inj.append("ai-rep")
+    if hcfg.inject_ai_card: _inj.append("ai-card")
+    if hcfg.inject_dialectic: _inj.append("dialectic")
+    print(f"  Injecting:         {', '.join(_inj) or 'nothing'}")
+    print(f"  Inject frequency:  {hcfg.injection_frequency}")
+
+    # Reasoning
+    cap_info = f" (cap: {hcfg.dialectic_reasoning_cap})" if hcfg.dialectic_reasoning_cap != hcfg.dialectic_reasoning_level else " (no auto-bump)"
+    print(f"  Reasoning level:   {hcfg.dialectic_reasoning_level}{cap_info}")
+
     if hcfg.enabled and (hcfg.api_key or hcfg.base_url):
         print("\n  Connection... ", end="", flush=True)
         try:
@@ -837,18 +855,37 @@ def cmd_tokens(args) -> None:
         ctx_tokens = hermes.get("contextTokens") or cfg.get("contextTokens") or "(Honcho default)"
         d_chars = hermes.get("dialecticMaxChars") or cfg.get("dialecticMaxChars") or 600
         d_level = hermes.get("dialecticReasoningLevel") or cfg.get("dialecticReasoningLevel") or "low"
-        print("\nHoncho budgets\n" + "─" * 40)
+        d_cap = hermes.get("dialecticReasoningCap") or cfg.get("dialecticReasoningCap") or d_level
+        ctx_cadence = hermes.get("contextCadence") or cfg.get("contextCadence") or "first-turn"
+        d_cadence = hermes.get("dialecticCadence") or cfg.get("dialecticCadence") or "first-turn"
+        print("\nHoncho budgets\n" + "=" * 40)
         print()
-        print(f"  Context     {ctx_tokens} tokens")
-        print("    Raw memory retrieval. Honcho returns stored facts/history about")
-        print("    the user and session, injected directly into the system prompt.")
+        print(f"  Context     {ctx_tokens} tokens   cadence: {ctx_cadence}")
+        print("    Peer representation + card. Fetched from Honcho and injected")
+        print("    into the system prompt. 'first-turn' fetches once per session.")
         print()
-        print(f"  Dialectic   {d_chars} chars, reasoning: {d_level}")
-        print("    AI-to-AI inference. Hermes asks Honcho's AI peer a question")
-        print("    (e.g. \"what were we working on?\") and Honcho runs its own model")
-        print("    to synthesize an answer. Used for first-turn session continuity.")
-        print("    Level controls how much reasoning Honcho spends on the answer.")
-        print("\n  Set with: hermes honcho tokens [--context N] [--dialectic N]\n")
+        cap_note = f"cap: {d_cap}" if d_cap != d_level else "no auto-bump"
+        print(f"  Dialectic   {d_chars} chars   reasoning: {d_level} ({cap_note})   cadence: {d_cadence}")
+        print("    AI-to-AI inference. Honcho runs its own model to synthesize")
+        print("    session continuity. Higher reasoning and cadence increase cost.")
+        print()
+        # Injection summary
+        _on = lambda k, d: hermes.get(k, cfg.get(k, d))
+        inj_items = [
+            ("representation", _on("injectRepresentation", True)),
+            ("card", _on("injectCard", True)),
+            ("ai-rep", _on("injectAiRepresentation", False)),
+            ("ai-card", _on("injectAiCard", False)),
+            ("dialectic", _on("injectDialectic", True)),
+        ]
+        enabled = [name for name, val in inj_items if val not in (False, "false", "0", "no")]
+        disabled = [name for name, val in inj_items if val in (False, "false", "0", "no")]
+        inj_freq = hermes.get("injectionFrequency") or cfg.get("injectionFrequency") or "every-turn"
+        print(f"  Injecting   {', '.join(enabled) or 'nothing'}   frequency: {inj_freq}")
+        if disabled:
+            print(f"  Suppressed  {', '.join(disabled)}")
+        print(f"\n  Set with: hermes honcho tokens [--context N] [--dialectic N]")
+        print(f"  Edit {_config_path()} for cadence, injection, and reasoning cap.\n")
         return
 
     host = _host_key()
