@@ -3388,30 +3388,17 @@ def cmd_update(args):
             text=True,
             check=True,
         )
-        current_branch = result.stdout.strip()
+        head_branch = result.stdout.strip()
 
-        # Always update against main
-        branch = "main"
-
-        # If user is on a non-main branch or detached HEAD, switch to main
-        if current_branch != "main":
-            label = "detached HEAD" if current_branch == "HEAD" else f"branch '{current_branch}'"
-            print(f"  ⚠ Currently on {label} — switching to main for update...")
-            # Stash before checkout so uncommitted work isn't lost
-            auto_stash_ref = _stash_local_changes_if_needed(git_cmd, PROJECT_ROOT)
-            subprocess.run(
-                git_cmd + ["checkout", "main"],
-                cwd=PROJECT_ROOT,
-                capture_output=True,
-                text=True,
-                check=True,
-            )
-        else:
-            auto_stash_ref = _stash_local_changes_if_needed(git_cmd, PROJECT_ROOT)
-
-        prompt_for_restore = auto_stash_ref is not None and (
-            gateway_mode or (sys.stdin.isatty() and sys.stdout.isatty())
+        # The update target is always main (or the current branch if it tracks
+        # a remote).  Fall back to main when the current branch has no remote.
+        branch = head_branch
+        verify = subprocess.run(
+            git_cmd + ["rev-parse", "--verify", f"origin/{branch}"],
+            cwd=PROJECT_ROOT, capture_output=True, text=True,
         )
+        if verify.returncode != 0:
+            branch = "main"
 
         # Check if there are updates
         result = subprocess.run(
@@ -3425,49 +3412,39 @@ def cmd_update(args):
 
         if commit_count == 0:
             _invalidate_update_cache()
-            # Restore stash and switch back to original branch if we moved
-            if auto_stash_ref is not None:
-                _restore_stashed_changes(
-                    git_cmd, PROJECT_ROOT, auto_stash_ref,
-                    prompt_user=prompt_for_restore,
-                    input_fn=gw_input_fn,
-                )
-            if current_branch not in ("main", "HEAD"):
-                subprocess.run(
-                    git_cmd + ["checkout", current_branch],
-                    cwd=PROJECT_ROOT, capture_output=True, text=True, check=False,
-                )
             print("✓ Already up to date!")
             return
 
         print(f"→ Found {commit_count} new commit(s)")
 
+        auto_stash_ref = _stash_local_changes_if_needed(git_cmd, PROJECT_ROOT)
+        prompt_for_restore = auto_stash_ref is not None and (
+            gateway_mode or (sys.stdin.isatty() and sys.stdout.isatty())
+        )
+
         print("→ Pulling updates...")
         update_succeeded = False
         try:
-            pull_result = subprocess.run(
-                git_cmd + ["pull", "--ff-only", "origin", branch],
-                cwd=PROJECT_ROOT,
-                capture_output=True,
-                text=True,
-            )
-            if pull_result.returncode != 0:
-                # ff-only failed — local and remote have diverged (e.g. upstream
-                # force-pushed or rebase).  Since local changes are already
-                # stashed, reset to match the remote exactly.
-                print("  ⚠ Fast-forward not possible (history diverged), resetting to match remote...")
-                reset_result = subprocess.run(
-                    git_cmd + ["reset", "--hard", f"origin/{branch}"],
-                    cwd=PROJECT_ROOT,
-                    capture_output=True,
-                    text=True,
+            if head_branch == branch:
+                # On the target branch -- try fast-forward, fall back to rebase.
+                try:
+                    subprocess.run(git_cmd + ["pull", "--ff-only", "origin", branch], cwd=PROJECT_ROOT, check=True)
+                except subprocess.CalledProcessError:
+                    print("  Fast-forward not possible, rebasing...")
+                    subprocess.run(git_cmd + ["pull", "--rebase", "origin", branch], cwd=PROJECT_ROOT, check=True)
+            else:
+                # On a different branch -- update the target ref without switching.
+                fetch_result = subprocess.run(
+                    git_cmd + ["fetch", "origin", f"{branch}:{branch}"],
+                    cwd=PROJECT_ROOT, capture_output=True, text=True,
                 )
-                if reset_result.returncode != 0:
-                    print(f"✗ Failed to reset to origin/{branch}.")
-                    if reset_result.stderr.strip():
-                        print(f"  {reset_result.stderr.strip()}")
-                    print("  Try manually: git fetch origin && git reset --hard origin/main")
-                    sys.exit(1)
+                if fetch_result.returncode != 0:
+                    # Local ref diverged -- force-update since user isn't on it.
+                    subprocess.run(
+                        git_cmd + ["branch", "-f", branch, f"origin/{branch}"],
+                        cwd=PROJECT_ROOT, check=True,
+                    )
+                print(f"  Updated local {branch} (staying on {head_branch})")
             update_succeeded = True
         finally:
             if auto_stash_ref is not None:

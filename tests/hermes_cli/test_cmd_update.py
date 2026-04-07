@@ -61,10 +61,9 @@ class TestCmdUpdateBranchFallback:
         assert "origin/main" in rev_list_cmds[0]
         assert "origin/fix/stoicneko" not in rev_list_cmds[0]
 
-        # pull should use main, not fix/stoicneko
-        pull_cmds = [c for c in commands if "pull" in c]
-        assert len(pull_cmds) == 1
-        assert "main" in pull_cmds[0]
+        # Should update main ref without switching branches (fetch origin main:main)
+        fetch_ref_cmds = [c for c in commands if "fetch" in c and "main:main" in c]
+        assert len(fetch_ref_cmds) == 1
 
     @patch("shutil.which", return_value=None)
     @patch("subprocess.run")
