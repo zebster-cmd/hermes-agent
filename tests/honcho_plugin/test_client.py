@@ -221,12 +221,23 @@ class TestFromGlobalConfig:
             config = HonchoClientConfig.from_global_config(config_path=config_file)
         assert config.base_url == "http://config-host:9000"
 
-    def test_base_url_not_read_from_host_block(self, tmp_path):
-        """baseUrl is a root-level connection setting, not overridable per-host (consistent with apiKey)."""
+    def test_base_url_host_block_overrides_root(self, tmp_path):
+        """Host-block baseUrl wins over root-level, enabling per-instance Honcho endpoints."""
         config_file = tmp_path / "config.json"
         config_file.write_text(json.dumps({
             "baseUrl": "http://root:9000",
             "hosts": {"hermes": {"baseUrl": "http://host-block:9001"}},
+        }))
+
+        config = HonchoClientConfig.from_global_config(config_path=config_file)
+        assert config.base_url == "http://host-block:9001"
+
+    def test_base_url_falls_back_to_root(self, tmp_path):
+        """When host block has no baseUrl, root-level is used."""
+        config_file = tmp_path / "config.json"
+        config_file.write_text(json.dumps({
+            "baseUrl": "http://root:9000",
+            "hosts": {"hermes": {"enabled": True}},
         }))
 
         config = HonchoClientConfig.from_global_config(config_path=config_file)
