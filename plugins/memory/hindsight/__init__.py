@@ -205,7 +205,19 @@ class HindsightMemoryProvider(MemoryProvider):
             cfg = _load_config()
             mode = cfg.get("mode", "cloud")
             if mode == "local":
+                try:
+                    __import__("hindsight")
+                except ImportError:
+                    logger.debug("Hindsight local mode unavailable: 'hindsight' package not installed")
+                    return False
                 return True
+            # Cloud mode: check that hindsight_client is importable
+            try:
+                __import__("hindsight_client")
+            except ImportError:
+                logger.debug("Hindsight cloud mode unavailable: 'hindsight-client' package not installed. "
+                             "Install with: pip install 'hermes-agent[hindsight]'")
+                return False
             has_key = bool(cfg.get("apiKey") or os.environ.get("HINDSIGHT_API_KEY", ""))
             has_url = bool(cfg.get("api_url") or os.environ.get("HINDSIGHT_API_URL", ""))
             return has_key or has_url
