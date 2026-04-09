@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import logging
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -29,6 +30,11 @@ logger = logging.getLogger(__name__)
 
 GLOBAL_CONFIG_PATH = Path.home() / ".honcho" / "config.json"
 HOST = "hermes"
+
+
+def _sanitize_peer_id(value: str) -> str:
+    """Sanitize a string to match Honcho's peer-id pattern: ^[a-zA-Z0-9_-]+$"""
+    return re.sub(r'[^a-zA-Z0-9_-]', '-', value)
 
 
 def resolve_active_host() -> str:
@@ -225,7 +231,7 @@ class HonchoClientConfig:
             api_key=api_key,
             environment=os.environ.get("HONCHO_ENVIRONMENT", "production"),
             base_url=base_url,
-            ai_peer=resolved_host,
+            ai_peer=_sanitize_peer_id(resolved_host),
             enabled=bool(api_key or base_url),
         )
 
@@ -263,7 +269,7 @@ class HonchoClientConfig:
             or raw.get("workspace")
             or resolved_host
         )
-        ai_peer = (
+        ai_peer = _sanitize_peer_id(
             host_block.get("aiPeer")
             or raw.get("aiPeer")
             or resolved_host
