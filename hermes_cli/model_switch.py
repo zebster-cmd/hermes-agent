@@ -21,22 +21,16 @@ OpenRouter variant suffixes (``:free``, ``:extended``, ``:fast``).
 from __future__ import annotations
 
 import logging
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import List, NamedTuple, Optional
 
 from hermes_cli.providers import (
-    ALIASES,
-    LABELS,
-    TRANSPORT_TO_API_MODE,
     determine_api_mode,
     get_label,
-    get_provider,
     is_aggregator,
-    normalize_provider,
     resolve_provider_full,
 )
 from hermes_cli.model_normalize import (
-    detect_vendor,
     normalize_model_for_provider,
 )
 from agent.models_dev import (
@@ -49,6 +43,25 @@ from agent.models_dev import (
 )
 
 logger = logging.getLogger(__name__)
+
+
+# ---------------------------------------------------------------------------
+# Non-agentic model warning
+# ---------------------------------------------------------------------------
+
+_HERMES_MODEL_WARNING = (
+    "Nous Research Hermes 3 & 4 models are NOT agentic and are not designed "
+    "for use with Hermes Agent. They lack the tool-calling capabilities "
+    "required for agent workflows. Consider using an agentic model instead "
+    "(Claude, GPT, Gemini, DeepSeek, etc.)."
+)
+
+
+def _check_hermes_model_warning(model_name: str) -> str:
+    """Return a warning string if *model_name* looks like a Hermes LLM model."""
+    if "hermes" in model_name.lower():
+        return _HERMES_MODEL_WARNING
+    return ""
 
 
 # ---------------------------------------------------------------------------
@@ -112,6 +125,71 @@ MODEL_ALIASES: dict[str, ModelIdentity] = {
     # Arcee
     "trinity":   ModelIdentity("arcee-ai", "trinity"),
 }
+
+
+# ---------------------------------------------------------------------------
+# Direct aliases — exact model+provider+base_url for endpoints that aren't
+# in the models.dev catalog (e.g. Ollama Cloud, local servers).
+# Checked BEFORE catalog resolution.  Format:
+#   alias -> (model_id, provider, base_url)
+# These can also be loaded from config.yaml ``model_aliases:`` section.
+# ---------------------------------------------------------------------------
+
+class DirectAlias(NamedTuple):
+    """Exact model mapping that bypasses catalog resolution."""
+    model: str
+    provider: str
+    base_url: str
+
+
+# Built-in direct aliases (can be extended via config.yaml model_aliases:)
+_BUILTIN_DIRECT_ALIASES: dict[str, DirectAlias] = {}
+
+# Merged dict (builtins + user config); populated by _load_direct_aliases()
+DIRECT_ALIASES: dict[str, DirectAlias] = {}
+
+
+def _load_direct_aliases() -> dict[str, DirectAlias]:
+    """Load direct aliases from config.yaml ``model_aliases:`` section.
+
+    Config format::
+
+        model_aliases:
+          qwen:
+            model: "qwen3.5:397b"
+            provider: custom
+            base_url: "https://ollama.com/v1"
+          minimax:
+            model: "minimax-m2.7"
+            provider: custom
+            base_url: "https://ollama.com/v1"
+    """
+    merged = dict(_BUILTIN_DIRECT_ALIASES)
+    try:
+        from hermes_cli.config import load_config
+        cfg = load_config()
+        user_aliases = cfg.get("model_aliases")
+        if isinstance(user_aliases, dict):
+            for name, entry in user_aliases.items():
+                if not isinstance(entry, dict):
+                    continue
+                model = entry.get("model", "")
+                provider = entry.get("provider", "custom")
+                base_url = entry.get("base_url", "")
+                if model:
+                    merged[name.strip().lower()] = DirectAlias(
+                        model=model, provider=provider, base_url=base_url,
+                    )
+    except Exception:
+        pass
+    return merged
+
+
+def _ensure_direct_aliases() -> None:
+    """Lazy-load direct aliases on first use."""
+    global DIRECT_ALIASES
+    if not DIRECT_ALIASES:
+        DIRECT_ALIASES = _load_direct_aliases()
 
 
 # ---------------------------------------------------------------------------
@@ -211,6 +289,20 @@ def resolve_alias(
         exist or no matching model is available.
     """
     key = raw_input.strip().lower()
+
+    # Check direct aliases first (exact model+provider+base_url mappings)
+    _ensure_direct_aliases()
+    direct = DIRECT_ALIASES.get(key)
+    if direct is not None:
+        return (direct.provider, direct.model, key)
+
+    # Reverse lookup: match by model ID so full names (e.g. "kimi-k2.5",
+    # "glm-4.7") route through direct aliases instead of falling through
+    # to the catalog/OpenRouter.
+    for alias_name, da in DIRECT_ALIASES.items():
+        if da.model.lower() == key:
+            return (da.provider, da.model, alias_name)
+
     identity = MODEL_ALIASES.get(key)
     if identity is None:
         return None
@@ -241,12 +333,37 @@ def resolve_alias(
     return None
 
 
+def get_authenticated_provider_slugs(
+    current_provider: str = "",
+    user_providers: dict = None,
+) -> list[str]:
+    """Return slugs of providers that have credentials.
+
+    Uses ``list_authenticated_providers()`` which is backed by the models.dev
+    in-memory cache (1 hr TTL) — no extra network cost.
+    """
+    try:
+        providers = list_authenticated_providers(
+            current_provider=current_provider,
+            user_providers=user_providers,
+            max_models=0,
+        )
+        return [p["slug"] for p in providers]
+    except Exception:
+        return []
+
+
 def _resolve_alias_fallback(
     raw_input: str,
-    fallback_providers: tuple[str, ...] = ("openrouter", "nous"),
+    authenticated_providers: list[str] = (),
 ) -> Optional[tuple[str, str, str]]:
-    """Try to resolve an alias on fallback providers."""
-    for provider in fallback_providers:
+    """Try to resolve an alias on the user's authenticated providers.
+
+    Falls back to ``("openrouter", "nous")`` only when no authenticated
+    providers are supplied (backwards compat for non-interactive callers).
+    """
+    providers = authenticated_providers or ("openrouter", "nous")
+    for provider in providers:
         result = resolve_alias(raw_input, provider)
         if result is not None:
             return result
@@ -321,14 +438,25 @@ def switch_model(
         # Resolve the provider
         pdef = resolve_provider_full(explicit_provider, user_providers)
         if pdef is None:
+            _switch_err = (
+                f"Unknown provider '{explicit_provider}'. "
+                f"Check 'hermes model' for available providers, or define it "
+                f"in config.yaml under 'providers:'."
+            )
+            # Check for common config issues that cause provider resolution failures
+            try:
+                from hermes_cli.config import validate_config_structure
+                _cfg_issues = validate_config_structure()
+                if _cfg_issues:
+                    _switch_err += "\n\nRun 'hermes doctor' — config issues detected:"
+                    for _ci in _cfg_issues[:3]:
+                        _switch_err += f"\n  • {_ci.message}"
+            except Exception:
+                pass
             return ModelSwitchResult(
                 success=False,
                 is_global=is_global,
-                error_message=(
-                    f"Unknown provider '{explicit_provider}'. "
-                    f"Check 'hermes model' for available providers, or define it "
-                    f"in config.yaml under 'providers:'."
-                ),
+                error_message=_switch_err,
             )
 
         target_provider = pdef.id
@@ -385,7 +513,11 @@ def switch_model(
             # --- Step b: Alias exists but not on current provider -> fallback ---
             key = raw_input.strip().lower()
             if key in MODEL_ALIASES:
-                fallback_result = _resolve_alias_fallback(raw_input)
+                authed = get_authenticated_provider_slugs(
+                    current_provider=current_provider,
+                    user_providers=user_providers,
+                )
+                fallback_result = _resolve_alias_fallback(raw_input, authed)
                 if fallback_result is not None:
                     target_provider, new_model, resolved_alias = fallback_result
                     logger.debug(
@@ -487,6 +619,15 @@ def switch_model(
         except Exception:
             pass
 
+    # --- Direct alias override: use exact base_url from the alias if set ---
+    if resolved_alias:
+        _ensure_direct_aliases()
+        _da = DIRECT_ALIASES.get(resolved_alias)
+        if _da is not None and _da.base_url:
+            base_url = _da.base_url
+            if not api_key:
+                api_key = "no-key-required"
+
     # --- Normalize model name for target provider ---
     new_model = normalize_model_for_provider(new_model, target_provider)
 
@@ -531,6 +672,14 @@ def switch_model(
     # --- Get full model info from models.dev ---
     model_info = get_model_info(target_provider, new_model)
 
+    # --- Collect warnings ---
+    warnings: list[str] = []
+    if validation.get("message"):
+        warnings.append(validation["message"])
+    hermes_warn = _check_hermes_model_warning(new_model)
+    if hermes_warn:
+        warnings.append(hermes_warn)
+
     # --- Build result ---
     return ModelSwitchResult(
         success=True,
@@ -540,7 +689,7 @@ def switch_model(
         api_key=api_key,
         base_url=base_url,
         api_mode=api_mode,
-        warning_message=validation.get("message") or "",
+        warning_message=" | ".join(warnings) if warnings else "",
         provider_label=provider_label,
         resolved_via_alias=resolved_alias,
         capabilities=capabilities,
@@ -642,12 +791,12 @@ def list_authenticated_providers(
         if overlay.auth_type in ("oauth_device_code", "oauth_external", "external_process"):
             # These use auth stores, not env vars — check for auth.json entries
             try:
-                from hermes_cli.auth import _read_auth_store
-                store = _read_auth_store()
-                if store and pid in store:
+                from hermes_cli.auth import _load_auth_store
+                store = _load_auth_store()
+                if store and (pid in store.get("providers", {}) or pid in store.get("credential_pool", {})):
                     has_creds = True
-            except Exception:
-                pass
+            except Exception as exc:
+                logger.debug("Auth store check failed for %s: %s", pid, exc)
         if not has_creds:
             continue
 

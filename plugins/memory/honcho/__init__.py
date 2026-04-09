@@ -21,6 +21,7 @@ import threading
 from typing import Any, Dict, List, Optional
 
 from agent.memory_provider import MemoryProvider
+from tools.registry import tool_error
 
 logger = logging.getLogger(__name__)
 
@@ -195,6 +196,30 @@ class HonchoMemoryProvider(MemoryProvider):
         self._prefetch_thread: Optional[threading.Thread] = None
         self._sync_thread: Optional[threading.Thread] = None
 
+        # B1: recall_mode — set during initialize from config
+        self._recall_mode = "hybrid"  # "context", "tools", or "hybrid"
+
+        # B4: First-turn context baking
+        self._first_turn_context: Optional[str] = None
+        self._first_turn_lock = threading.Lock()
+
+        # B5: Cost-awareness turn counting and cadence
+        self._turn_count = 0
+        self._injection_frequency = "every-turn"  # or "first-turn"
+        self._context_cadence = 1   # minimum turns between context API calls
+        self._dialectic_cadence = 1  # minimum turns between dialectic API calls
+        self._reasoning_level_cap: Optional[str] = None  # "minimal", "low", "mid", "high"
+        self._last_context_turn = -999
+        self._last_dialectic_turn = -999
+
+        # Port #1957: lazy session init for tools-only mode
+        self._session_initialized = False
+        self._lazy_init_kwargs: Optional[dict] = None
+        self._lazy_init_session_id: Optional[str] = None
+
+        # Port #4053: cron guard — when True, plugin is fully inactive
+        self._cron_skipped = False
+
     @property
     def name(self) -> str:
         return "honcho"
@@ -253,6 +278,12 @@ class HonchoMemoryProvider(MemoryProvider):
                 logger.debug("Honcho not configured — plugin inactive")
                 return
 
+            # Override peer_name with gateway user_id for per-user memory scoping.
+            # CLI sessions won't have user_id, so the config default is preserved.
+            _gw_user_id = kwargs.get("user_id")
+            if _gw_user_id:
+                cfg.peer_name = _gw_user_id
+
             self._config = cfg
             client = get_honcho_client(cfg)
             self._manager = HonchoSessionManager(
@@ -268,6 +299,30 @@ class HonchoMemoryProvider(MemoryProvider):
                 self._session_key = f"{platform}:{user_id}"
             else:
                 self._session_key = session_id
+
+            # ----- B1: recall_mode from config -----
+            self._recall_mode = cfg.recall_mode  # "context", "tools", or "hybrid"
+            logger.debug("Honcho recall_mode: %s", self._recall_mode)
+
+            # ----- B5: cost-awareness config -----
+            try:
+                raw = cfg.raw or {}
+                self._injection_frequency = raw.get("injectionFrequency", "every-turn")
+                self._context_cadence = int(raw.get("contextCadence", 1))
+                self._dialectic_cadence = int(raw.get("dialecticCadence", 1))
+                cap = raw.get("reasoningLevelCap")
+                if cap and cap in ("minimal", "low", "mid", "high"):
+                    self._reasoning_level_cap = cap
+            except Exception as e:
+                logger.debug("Honcho cost-awareness config parse error: %s", e)
+
+            # ----- Port #1957: lazy session init for tools-only mode -----
+            if self._recall_mode == "tools":
+                self._lazy_init_kwargs = kwargs
+                self._lazy_init_session_id = session_id
+                self._config = cfg
+                logger.debug("Honcho tools-only mode — deferring session init until first tool call")
+                return
 
         except ImportError:
             logger.debug("honcho-ai package not installed — plugin inactive")
@@ -336,24 +391,23 @@ class HonchoMemoryProvider(MemoryProvider):
         remaining = content
         first = True
         while remaining:
-            budget = limit if first else limit - prefix_len
-            if len(remaining) <= budget:
+            effective = limit if first else limit - prefix_len
+            if len(remaining) <= effective:
                 chunks.append(remaining if first else prefix + remaining)
                 break
 
-            effective_limit = limit if first else limit - prefix_len
-            segment = remaining[:effective_limit]
+            segment = remaining[:effective]
 
             # Try paragraph break, then sentence, then word
             cut = segment.rfind("\n\n")
-            if cut < effective_limit * 0.3:
+            if cut < effective * 0.3:
                 cut = segment.rfind(". ")
                 if cut >= 0:
                     cut += 2  # include the period and space
-            if cut < effective_limit * 0.3:
+            if cut < effective * 0.3:
                 cut = segment.rfind(" ")
-            if cut < effective_limit * 0.3:
-                cut = effective_limit  # hard cut
+            if cut < effective * 0.3:
+                cut = effective  # hard cut
 
             chunk = remaining[:cut].rstrip()
             remaining = remaining[cut:].lstrip()
@@ -364,12 +418,14 @@ class HonchoMemoryProvider(MemoryProvider):
 
         return chunks
 
-    def sync_turn(self, user_content: str, assistant_content: str) -> None:
+    def sync_turn(self, user_content: str, assistant_content: str, *, session_id: str = "") -> None:
         """Record the conversation turn in Honcho (non-blocking).
 
         Messages exceeding the Honcho API limit (default 25k chars) are
         split into multiple messages with continuation markers.
         """
+        if self._cron_skipped:
+            return
         if not self._manager or not self._session_key:
             return
 
@@ -377,7 +433,7 @@ class HonchoMemoryProvider(MemoryProvider):
 
         def _sync():
             try:
-                session = self._manager.get_or_create_session(self._session_key)
+                session = self._manager.get_or_create(self._session_key)
                 for chunk in self._chunk_message(user_content, msg_limit):
                     session.add_message("user", chunk)
                 for chunk in self._chunk_message(assistant_content, msg_limit):
@@ -443,8 +499,17 @@ class HonchoMemoryProvider(MemoryProvider):
             return self._manager._get_or_create_peer(sanitized)
 
     def handle_tool_call(self, tool_name: str, args: dict, **kwargs) -> str:
+        """Handle a Honcho tool call, with lazy session init for tools-only mode."""
+        if self._cron_skipped:
+            return tool_error("Honcho is not active (cron context).")
+
+        # Port #1957: ensure session is initialized for tools-only mode
+        if not self._session_initialized:
+            if not self._ensure_session():
+                return tool_error("Honcho session could not be initialized.")
+
         if not self._manager or not self._session_key:
-            return json.dumps({"error": "Honcho is not active for this session."})
+            return tool_error("Honcho is not active for this session.")
 
         try:
             if tool_name == "honcho_profile":
@@ -484,7 +549,7 @@ class HonchoMemoryProvider(MemoryProvider):
             elif tool_name == "honcho_search":
                 query = args.get("query", "")
                 if not query:
-                    return json.dumps({"error": "Missing required parameter: query"})
+                    return tool_error("Missing required parameter: query")
                 max_tokens = min(int(args.get("max_tokens", 800)), 2000)
                 result = self._manager.search_context(
                     self._session_key, query, max_tokens=max_tokens
@@ -496,7 +561,7 @@ class HonchoMemoryProvider(MemoryProvider):
             elif tool_name == "honcho_context":
                 query = args.get("query", "")
                 if not query:
-                    return json.dumps({"error": "Missing required parameter: query"})
+                    return tool_error("Missing required parameter: query")
                 # Dialectic input guard — truncate long queries
                 max_input = self._config.dialectic_max_input_chars if self._config else 10000
                 if len(query) > max_input:
@@ -510,11 +575,11 @@ class HonchoMemoryProvider(MemoryProvider):
             elif tool_name == "honcho_conclude":
                 conclusion = args.get("conclusion", "")
                 if not conclusion:
-                    return json.dumps({"error": "Missing required parameter: conclusion"})
+                    return tool_error("Missing required parameter: conclusion")
                 ok = self._manager.create_conclusion(self._session_key, conclusion)
                 if ok:
                     return json.dumps({"result": f"Conclusion saved: {conclusion}"})
-                return json.dumps({"error": "Failed to save conclusion."})
+                return tool_error("Failed to save conclusion.")
 
             elif tool_name == "honcho_peers":
                 action = args.get("action", "list")
@@ -576,11 +641,11 @@ class HonchoMemoryProvider(MemoryProvider):
 
                 return json.dumps({"error": f"Unknown action: {action}"})
 
-            return json.dumps({"error": f"Unknown tool: {tool_name}"})
+            return tool_error(f"Unknown tool: {tool_name}")
 
         except Exception as e:
             logger.error("Honcho tool %s failed: %s", tool_name, e)
-            return json.dumps({"error": f"Honcho {tool_name} failed: {e}"})
+            return tool_error(f"Honcho {tool_name} failed: {e}")
 
     def shutdown(self) -> None:
         for t in (self._prefetch_thread, self._sync_thread):

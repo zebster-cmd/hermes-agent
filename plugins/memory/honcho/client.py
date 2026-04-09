@@ -77,33 +77,21 @@ def resolve_config_path() -> Path:
 
 _RECALL_MODE_ALIASES = {"auto": "hybrid"}
 _VALID_RECALL_MODES = {"hybrid", "context", "tools"}
-_BASE_URL_KEYS = ("baseUrl", "base_url", "baseURL")
-
-
-def _resolve_base_url(*sources: dict[str, Any] | None) -> str | None:
-    """Resolve base_url from one or more config dicts plus env fallback.
-
-    Resolution order follows the given source order, then HONCHO_BASE_URL.
-    Prefers canonical camelCase ``baseUrl``, while accepting ``base_url``
-    and ``baseURL`` as compatibility aliases.
-    """
-    for source in sources:
-        if not isinstance(source, dict):
-            continue
-        for key in _BASE_URL_KEYS:
-            value = source.get(key)
-            if isinstance(value, str):
-                stripped = value.strip()
-                if stripped:
-                    return stripped
-    env_value = os.environ.get("HONCHO_BASE_URL", "").strip()
-    return env_value or None
 
 
 def _normalize_recall_mode(val: str) -> str:
     """Normalize legacy recall mode values (e.g. 'auto' → 'hybrid')."""
     val = _RECALL_MODE_ALIASES.get(val, val)
     return val if val in _VALID_RECALL_MODES else "hybrid"
+
+
+def _resolve_bool(host_val, root_val, *, default: bool) -> bool:
+    """Resolve a bool config field: host wins, then root, then default."""
+    if host_val is not None:
+        return bool(host_val)
+    if root_val is not None:
+        return bool(root_val)
+    return default
 
 
 _VALID_OBSERVATION_MODES = {"unified", "directional"}
@@ -114,15 +102,6 @@ def _normalize_observation_mode(val: str) -> str:
     """Normalize observation mode values."""
     val = _OBSERVATION_MODE_ALIASES.get(val, val)
     return val if val in _VALID_OBSERVATION_MODES else "directional"
-
-
-def _resolve_bool(host_val, root_val, *, default: bool) -> bool:
-    """Resolve a bool config field: host wins, then root, then default."""
-    if host_val is not None:
-        return bool(host_val)
-    if root_val is not None:
-        return bool(root_val)
-    return default
 
 
 # Observation presets — granular booleans derived from legacy string mode.
@@ -165,6 +144,9 @@ def _resolve_observation(
         "ai_observe_me": ai_block.get("observeMe", preset["ai_observe_me"]),
         "ai_observe_others": ai_block.get("observeOthers", preset["ai_observe_others"]),
     }
+
+
+
 
 
 @dataclass
@@ -286,7 +268,6 @@ class HonchoClientConfig:
             or raw.get("aiPeer")
             or resolved_host
         )
-
         api_key = (
             host_block.get("apiKey")
             or raw.get("apiKey")
@@ -385,16 +366,21 @@ class HonchoClientConfig:
                 or raw.get("recallMode")
                 or "hybrid"
             ),
+            # Migration guard: existing configs without an explicit
+            # observationMode keep the old "unified" default so users
+            # aren't silently switched to full bidirectional observation.
+            # New installations (no host block, no credentials) get
+            # "directional" (all observations on) as the new default.
             observation_mode=_normalize_observation_mode(
                 host_block.get("observationMode")
                 or raw.get("observationMode")
-                or "directional"
+                or ("unified" if _explicitly_configured else "directional")
             ),
             **_resolve_observation(
                 _normalize_observation_mode(
                     host_block.get("observationMode")
                     or raw.get("observationMode")
-                    or "directional"
+                    or ("unified" if _explicitly_configured else "directional")
                 ),
                 host_block.get("observation") or raw.get("observation"),
             ),
@@ -479,7 +465,6 @@ class HonchoClientConfig:
         return self.workspace_id
 
 
-
 _honcho_client: Honcho | None = None
 
 
@@ -523,7 +508,7 @@ def get_honcho_client(config: HonchoClientConfig | None = None) -> Honcho:
             hermes_cfg = load_config()
             honcho_cfg = hermes_cfg.get("honcho", {})
             if isinstance(honcho_cfg, dict):
-                resolved_base_url = _resolve_base_url(honcho_cfg)
+                resolved_base_url = honcho_cfg.get("base_url", "").strip() or None
         except Exception:
             pass
 
