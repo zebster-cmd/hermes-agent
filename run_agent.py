@@ -5858,8 +5858,12 @@ class AIAgent:
                 old_text=function_args.get("old_text"),
                 store=self._memory_store,
             )
-            # Bridge: notify external memory provider of built-in memory writes
-            if self._memory_manager and function_args.get("action") in ("add", "replace"):
+            # Bridge: notify external memory provider of built-in memory writes.
+            # Only mirror 'memory' target writes (environment/tool notes).
+            # 'user' target is now shared team/project context, NOT per-user
+            # profiling — Honcho handles per-user profiling via its own
+            # observation system and honcho_conclude tool.
+            if self._memory_manager and function_args.get("action") in ("add", "replace") and target == "memory":
                 try:
                     self._memory_manager.on_memory_write(
                         function_args.get("action", ""),

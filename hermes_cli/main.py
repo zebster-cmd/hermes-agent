@@ -1757,7 +1757,7 @@ _PROVIDER_MODELS = {
     # Format: HF model ID → OpenRouter equivalent noted in comment
     "huggingface": [
         "Qwen/Qwen3.5-397B-A17B",                  # ↔ qwen/qwen3.5-plus
-        "Qwen/Qwen3.5-35B-A3B",                     # ↔ qwen/qwen3.5-35b-a3b
+        "Sehyo/Qwen3.5-35B-A3B-NVFP4",              # ↔ qwen/qwen3.5-35b-a3b
         "deepseek-ai/DeepSeek-V3.2",                # ↔ deepseek/deepseek-chat
         "moonshotai/Kimi-K2.5",                      # ↔ moonshotai/kimi-k2.5
         "MiniMaxAI/MiniMax-M2.5",                    # ↔ minimax/minimax-m2.5

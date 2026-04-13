@@ -259,7 +259,7 @@ _PROVIDER_MODELS: dict[str, list[str]] = {
     # Curated HF model list — only agentic models that map to OpenRouter defaults.
     "huggingface": [
         "Qwen/Qwen3.5-397B-A17B",
-        "Qwen/Qwen3.5-35B-A3B",
+        "Sehyo/Qwen3.5-35B-A3B-NVFP4",
         "deepseek-ai/DeepSeek-V3.2",
         "moonshotai/Kimi-K2.5",
         "MiniMaxAI/MiniMax-M2.5",

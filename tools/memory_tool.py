@@ -5,8 +5,10 @@ Memory Tool Module - Persistent Curated Memory
 Provides bounded, file-backed memory that persists across sessions. Two stores:
   - MEMORY.md: agent's personal notes and observations (environment facts, project
     conventions, tool quirks, things learned)
-  - USER.md: what the agent knows about the user (preferences, communication style,
-    expectations, workflow habits)
+  - USER.md: shared team and project context (team structure, company conventions,
+    project architecture, shared workflow preferences). When Honcho is active,
+    individual user profiling is handled by Honcho's per-user observation system
+    and honcho_conclude tool — USER.md stays generalistic.
 
 Both are injected into the system prompt as a frozen snapshot at session start.
 Mid-session writes update files on disk immediately (durable) but do NOT change
@@ -375,7 +377,7 @@ class MemoryStore:
         pct = min(100, int((current / limit) * 100)) if limit > 0 else 0
 
         if target == "user":
-            header = f"USER PROFILE (who the user is) [{pct}% — {current:,}/{limit:,} chars]"
+            header = f"SHARED CONTEXT (team & project) [{pct}% — {current:,}/{limit:,} chars]"
         else:
             header = f"MEMORY (your personal notes) [{pct}% — {current:,}/{limit:,} chars]"
 
@@ -493,23 +495,29 @@ MEMORY_SCHEMA = {
         "Memory is injected into future turns, so keep it compact and focused on facts "
         "that will still matter later.\n\n"
         "WHEN TO SAVE (do this proactively, don't wait to be asked):\n"
-        "- User corrects you or says 'remember this' / 'don't do that again'\n"
-        "- User shares a preference, habit, or personal detail (name, role, timezone, coding style)\n"
         "- You discover something about the environment (OS, installed tools, project structure)\n"
-        "- You learn a convention, API quirk, or workflow specific to this user's setup\n"
-        "- You identify a stable fact that will be useful again in future sessions\n\n"
-        "PRIORITY: User preferences and corrections > environment facts > procedural knowledge. "
-        "The most valuable memory prevents the user from having to repeat themselves.\n\n"
+        "- You learn a convention, API quirk, or workflow specific to this setup\n"
+        "- You identify a stable fact that will be useful again in future sessions\n"
+        "- Team structure, shared workflows, or company-wide conventions are shared\n"
+        "- Cross-cutting context that applies to all users (project architecture, deployment policies)\n\n"
+        "HONCHO HANDLES PER-USER PROFILING: If Honcho memory is active, do NOT save individual "
+        "user preferences, personal details (name, role, timezone), communication style, or "
+        "per-person corrections to this tool. Use honcho_conclude for those instead — Honcho "
+        "tracks per-user profiles automatically across sessions.\n\n"
+        "PRIORITY: Environment and project facts > shared team conventions > procedural knowledge. "
+        "The most valuable memory prevents repeating setup/discovery work.\n\n"
         "Do NOT save task progress, session outcomes, completed-work logs, or temporary TODO "
         "state to memory; use session_search to recall those from past transcripts.\n"
         "If you've discovered a new way to do something, solved a problem that could be "
         "necessary later, save it as a skill with the skill tool.\n\n"
         "TWO TARGETS:\n"
-        "- 'user': who the user is -- name, role, preferences, communication style, pet peeves\n"
-        "- 'memory': your notes -- environment facts, project conventions, tool quirks, lessons learned\n\n"
+        "- 'user': shared team/project context -- team structure, company conventions, project "
+        "architecture, shared workflow preferences (NOT individual user profiles when Honcho is active)\n"
+        "- 'memory': your notes -- environment facts, tool quirks, lessons learned, technical discoveries\n\n"
         "ACTIONS: add (new entry), replace (update existing -- old_text identifies it), "
         "remove (delete -- old_text identifies it).\n\n"
-        "SKIP: trivial/obvious info, things easily re-discovered, raw data dumps, and temporary task state."
+        "SKIP: trivial/obvious info, things easily re-discovered, raw data dumps, temporary task state, "
+        "and per-user personal details (use honcho_conclude when Honcho is active)."
     ),
     "parameters": {
         "type": "object",
@@ -522,7 +530,7 @@ MEMORY_SCHEMA = {
             "target": {
                 "type": "string",
                 "enum": ["memory", "user"],
-                "description": "Which memory store: 'memory' for personal notes, 'user' for user profile."
+                "description": "Which memory store: 'memory' for personal notes, 'user' for shared team/project context."
             },
             "content": {
                 "type": "string",
