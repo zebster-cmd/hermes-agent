@@ -7,6 +7,7 @@ import logging
 import os
 import threading
 from pathlib import Path
+from tools.binary_extensions import has_binary_extension
 from tools.file_operations import ShellFileOperations
 from agent.redact import redact_sensitive_text
 
@@ -91,7 +92,10 @@ def _is_blocked_device(filepath: str) -> bool:
 
 # Paths that file tools should refuse to write to without going through the
 # terminal tool's approval system.  These match prefixes after os.path.realpath.
-_SENSITIVE_PATH_PREFIXES = ("/etc/", "/boot/", "/usr/lib/systemd/")
+_SENSITIVE_PATH_PREFIXES = (
+    "/etc/", "/boot/", "/usr/lib/systemd/",
+    "/private/etc/", "/private/var/",
+)
 _SENSITIVE_EXACT_PATHS = {"/var/run/docker.sock", "/run/docker.sock"}
 
 
@@ -101,17 +105,16 @@ def _check_sensitive_path(filepath: str) -> str | None:
         resolved = os.path.realpath(os.path.expanduser(filepath))
     except (OSError, ValueError):
         resolved = filepath
+    normalized = os.path.normpath(os.path.expanduser(filepath))
+    _err = (
+        f"Refusing to write to sensitive system path: {filepath}\n"
+        "Use the terminal tool with sudo if you need to modify system files."
+    )
     for prefix in _SENSITIVE_PATH_PREFIXES:
-        if resolved.startswith(prefix):
-            return (
-                f"Refusing to write to sensitive system path: {filepath}\n"
-                "Use the terminal tool with sudo if you need to modify system files."
-            )
-    if resolved in _SENSITIVE_EXACT_PATHS:
-        return (
-            f"Refusing to write to sensitive system path: {filepath}\n"
-            "Use the terminal tool with sudo if you need to modify system files."
-        )
+        if resolved.startswith(prefix) or normalized.startswith(prefix):
+            return _err
+    if resolved in _SENSITIVE_EXACT_PATHS or normalized in _SENSITIVE_EXACT_PATHS:
+        return _err
     return None
 
 
@@ -144,6 +147,58 @@ _file_ops_cache: dict = {}
 #                      by the same task don't trigger false warnings.
 _read_tracker_lock = threading.Lock()
 _read_tracker: dict = {}
+
+# Per-task bounds for the containers inside each _read_tracker[task_id].
+# A CLI session uses one stable task_id for its lifetime; without these
+# caps, a 10k-read session would accumulate ~1.5MB of dict/set state that
+# is never referenced again (only the most recent reads matter for dedup,
+# loop detection, and external-edit warnings).  Hard caps bound the
+# accretion to a few hundred KB regardless of session length.
+_READ_HISTORY_CAP = 500       # set; used only by get_read_files_summary
+_DEDUP_CAP = 1000             # dict; skip-identical-reread guard
+_READ_TIMESTAMPS_CAP = 1000   # dict; external-edit detection for write/patch
+
+
+def _cap_read_tracker_data(task_data: dict) -> None:
+    """Enforce size caps on the per-task read-tracker sub-containers.
+
+    Must be called with ``_read_tracker_lock`` held.  Eviction policy:
+
+      * ``read_history`` (set): pop arbitrary entries on overflow.  This
+        is fine because the set only feeds diagnostic summaries; losing
+        old entries just trims the summary's tail.
+      * ``dedup`` / ``read_timestamps`` (dict): pop oldest by insertion
+        order (Python 3.7+ dicts).  Evicted entries lose their dedup
+        skip on a future re-read (the file gets re-sent once) and
+        external-edit mtime comparison (the write/patch falls back to
+        a non-mtime check).  Both are graceful degradations, not bugs.
+    """
+    rh = task_data.get("read_history")
+    if rh is not None and len(rh) > _READ_HISTORY_CAP:
+        excess = len(rh) - _READ_HISTORY_CAP
+        for _ in range(excess):
+            try:
+                rh.pop()
+            except KeyError:
+                break
+
+    dedup = task_data.get("dedup")
+    if dedup is not None and len(dedup) > _DEDUP_CAP:
+        excess = len(dedup) - _DEDUP_CAP
+        for _ in range(excess):
+            try:
+                dedup.pop(next(iter(dedup)))
+            except (StopIteration, KeyError):
+                break
+
+    ts = task_data.get("read_timestamps")
+    if ts is not None and len(ts) > _READ_TIMESTAMPS_CAP:
+        excess = len(ts) - _READ_TIMESTAMPS_CAP
+        for _ in range(excess):
+            try:
+                ts.pop(next(iter(ts)))
+            except (StopIteration, KeyError):
+                break
 
 
 def _get_file_ops(task_id: str = "default") -> ShellFileOperations:
@@ -290,11 +345,22 @@ def read_file_tool(path: str, offset: int = 1, limit: int = 500, task_id: str = 
                 ),
             })
 
+        _resolved = Path(path).expanduser().resolve()
+
+        # ── Binary file guard ─────────────────────────────────────────
+        # Block binary files by extension (no I/O).
+        if has_binary_extension(str(_resolved)):
+            _ext = _resolved.suffix.lower()
+            return json.dumps({
+                "error": (
+                    f"Cannot read binary file '{path}' ({_ext}). "
+                    "Use vision_analyze for images, or terminal to inspect binary files."
+                ),
+            })
+
         # ── Hermes internal path guard ────────────────────────────────
         # Prevent prompt injection via catalog or hub metadata files.
-        import pathlib as _pathlib
         from hermes_constants import get_hermes_home as _get_hh
-        _resolved = _pathlib.Path(path).expanduser().resolve()
         _hermes_home = _get_hh().resolve()
         _blocked_dirs = [
             _hermes_home / "skills" / ".hub" / "index-cache",
@@ -345,8 +411,6 @@ def read_file_tool(path: str, offset: int = 1, limit: int = 500, task_id: str = 
         # ── Perform the read ──────────────────────────────────────────
         file_ops = _get_file_ops(task_id)
         result = file_ops.read_file(path, offset, limit)
-        if result.content:
-            result.content = redact_sensitive_text(result.content)
         result_dict = result.to_dict()
 
         # ── Character-count guard ─────────────────────────────────────
@@ -355,6 +419,7 @@ def read_file_tool(path: str, offset: int = 1, limit: int = 500, task_id: str = 
         # amount of content, reject it and tell the model to narrow down.
         # Note: we check the formatted content (with line-number prefixes),
         # not the raw file size, because that's what actually enters context.
+        # Check BEFORE redaction to avoid expensive regex on huge content.
         content_len = len(result.content or "")
         file_size = result_dict.get("file_size", 0)
         max_chars = _get_max_read_chars()
@@ -371,6 +436,11 @@ def read_file_tool(path: str, offset: int = 1, limit: int = 500, task_id: str = 
                 "total_lines": total_lines,
                 "file_size": file_size,
             }, ensure_ascii=False)
+
+        # ── Redact secrets (after guard check to skip oversized content) ──
+        if result.content:
+            result.content = redact_sensitive_text(result.content)
+            result_dict["content"] = result.content
 
         # Large-file hint: if the file is big and the caller didn't ask
         # for a narrow window, nudge toward targeted reads.
@@ -408,6 +478,10 @@ def read_file_tool(path: str, offset: int = 1, limit: int = 500, task_id: str = 
             except OSError:
                 pass  # Can't stat — skip tracking for this entry
 
+            # Bound the per-task containers so a long CLI session doesn't
+            # accumulate megabytes of dict/set state.  See _cap_read_tracker_data.
+            _cap_read_tracker_data(task_data)
+
         if count >= 4:
             # Hard block: stop returning content to break the loop
             return json.dumps({
@@ -428,41 +502,9 @@ def read_file_tool(path: str, offset: int = 1, limit: int = 500, task_id: str = 
 
         return json.dumps(result_dict, ensure_ascii=False)
     except Exception as e:
-        return json.dumps({"error": str(e)}, ensure_ascii=False)
+        return tool_error(str(e))
 
 
-def get_read_files_summary(task_id: str = "default") -> list:
-    """Return a list of files read in this session for the given task.
-
-    Used by context compression to preserve file-read history across
-    compression boundaries.
-    """
-    with _read_tracker_lock:
-        task_data = _read_tracker.get(task_id, {})
-        read_history = task_data.get("read_history", set())
-        seen_paths: dict = {}
-        for (path, offset, limit) in read_history:
-            if path not in seen_paths:
-                seen_paths[path] = []
-            seen_paths[path].append(f"lines {offset}-{offset + limit - 1}")
-        return [
-            {"path": p, "regions": regions}
-            for p, regions in sorted(seen_paths.items())
-        ]
-
-
-def clear_read_tracker(task_id: str = None):
-    """Clear the read tracker.
-
-    Call with a task_id to clear just that task, or without to clear all.
-    Should be called when a session is destroyed to prevent memory leaks
-    in long-running gateway processes.
-    """
-    with _read_tracker_lock:
-        if task_id:
-            _read_tracker.pop(task_id, None)
-        else:
-            _read_tracker.clear()
 
 
 def reset_file_dedup(task_id: str = None):
@@ -519,6 +561,7 @@ def _update_read_timestamp(filepath: str, task_id: str) -> None:
         task_data = _read_tracker.get(task_id)
         if task_data is not None:
             task_data.setdefault("read_timestamps", {})[resolved] = current_mtime
+            _cap_read_tracker_data(task_data)
 
 
 def _check_file_staleness(filepath: str, task_id: str) -> str | None:
@@ -556,7 +599,7 @@ def write_file_tool(path: str, content: str, task_id: str = "default") -> str:
     """Write content to a file."""
     sensitive_err = _check_sensitive_path(path)
     if sensitive_err:
-        return json.dumps({"error": sensitive_err}, ensure_ascii=False)
+        return tool_error(sensitive_err)
     try:
         stale_warning = _check_file_staleness(path, task_id)
         file_ops = _get_file_ops(task_id)
@@ -573,7 +616,7 @@ def write_file_tool(path: str, content: str, task_id: str = "default") -> str:
             logger.debug("write_file expected denial: %s: %s", type(e).__name__, e)
         else:
             logger.error("write_file error: %s: %s", type(e).__name__, e, exc_info=True)
-        return json.dumps({"error": str(e)}, ensure_ascii=False)
+        return tool_error(str(e))
 
 
 def patch_tool(mode: str = "replace", path: str = None, old_string: str = None,
@@ -591,7 +634,7 @@ def patch_tool(mode: str = "replace", path: str = None, old_string: str = None,
     for _p in _paths_to_check:
         sensitive_err = _check_sensitive_path(_p)
         if sensitive_err:
-            return json.dumps({"error": sensitive_err}, ensure_ascii=False)
+            return tool_error(sensitive_err)
     try:
         # Check staleness for all files this patch will touch.
         stale_warnings = []
@@ -604,16 +647,16 @@ def patch_tool(mode: str = "replace", path: str = None, old_string: str = None,
         
         if mode == "replace":
             if not path:
-                return json.dumps({"error": "path required"})
+                return tool_error("path required")
             if old_string is None or new_string is None:
-                return json.dumps({"error": "old_string and new_string required"})
+                return tool_error("old_string and new_string required")
             result = file_ops.patch_replace(path, old_string, new_string, replace_all)
         elif mode == "patch":
             if not patch:
-                return json.dumps({"error": "patch content required"})
+                return tool_error("patch content required")
             result = file_ops.patch_v4a(patch)
         else:
-            return json.dumps({"error": f"Unknown mode: {mode}"})
+            return tool_error(f"Unknown mode: {mode}")
         
         result_dict = result.to_dict()
         if stale_warnings:
@@ -630,7 +673,7 @@ def patch_tool(mode: str = "replace", path: str = None, old_string: str = None,
             result_json += "\n\n[Hint: old_string not found. Use read_file to verify the current content, or search_files to locate the text.]"
         return result_json
     except Exception as e:
-        return json.dumps({"error": str(e)}, ensure_ascii=False)
+        return tool_error(str(e))
 
 
 def search_tool(pattern: str, target: str = "content", path: str = ".",
@@ -698,26 +741,15 @@ def search_tool(pattern: str, target: str = "content", path: str = ".",
             result_json += f"\n\n[Hint: Results truncated. Use offset={next_offset} to see more, or narrow with a more specific pattern or file_glob.]"
         return result_json
     except Exception as e:
-        return json.dumps({"error": str(e)}, ensure_ascii=False)
+        return tool_error(str(e))
 
 
-FILE_TOOLS = [
-    {"name": "read_file", "function": read_file_tool},
-    {"name": "write_file", "function": write_file_tool},
-    {"name": "patch", "function": patch_tool},
-    {"name": "search_files", "function": search_tool}
-]
-
-
-def get_file_tools():
-    """Get the list of file tool definitions."""
-    return FILE_TOOLS
 
 
 # ---------------------------------------------------------------------------
 # Schemas + Registry
 # ---------------------------------------------------------------------------
-from tools.registry import registry
+from tools.registry import registry, tool_error
 
 
 def _check_file_reqs():
@@ -818,7 +850,7 @@ def _handle_search_files(args, **kw):
         output_mode=args.get("output_mode", "content"), context=args.get("context", 0), task_id=tid)
 
 
-registry.register(name="read_file", toolset="file", schema=READ_FILE_SCHEMA, handler=_handle_read_file, check_fn=_check_file_reqs, emoji="📖")
-registry.register(name="write_file", toolset="file", schema=WRITE_FILE_SCHEMA, handler=_handle_write_file, check_fn=_check_file_reqs, emoji="✍️")
-registry.register(name="patch", toolset="file", schema=PATCH_SCHEMA, handler=_handle_patch, check_fn=_check_file_reqs, emoji="🔧")
-registry.register(name="search_files", toolset="file", schema=SEARCH_FILES_SCHEMA, handler=_handle_search_files, check_fn=_check_file_reqs, emoji="🔎")
+registry.register(name="read_file", toolset="file", schema=READ_FILE_SCHEMA, handler=_handle_read_file, check_fn=_check_file_reqs, emoji="📖", max_result_size_chars=float('inf'))
+registry.register(name="write_file", toolset="file", schema=WRITE_FILE_SCHEMA, handler=_handle_write_file, check_fn=_check_file_reqs, emoji="✍️", max_result_size_chars=100_000)
+registry.register(name="patch", toolset="file", schema=PATCH_SCHEMA, handler=_handle_patch, check_fn=_check_file_reqs, emoji="🔧", max_result_size_chars=100_000)
+registry.register(name="search_files", toolset="file", schema=SEARCH_FILES_SCHEMA, handler=_handle_search_files, check_fn=_check_file_reqs, emoji="🔎", max_result_size_chars=100_000)

@@ -16,7 +16,6 @@ Key design decisions:
 
 import json
 import logging
-import os
 import random
 import re
 import sqlite3
@@ -349,13 +348,6 @@ class SessionDB:
 
         self._conn.commit()
 
-    def close(self):
-        """Close the database connection."""
-        with self._lock:
-            if self._conn:
-                self._conn.close()
-                self._conn = None
-
     # =========================================================================
     # Session lifecycle
     # =========================================================================
@@ -525,72 +517,6 @@ class SessionDB:
                    (id, source, model, started_at)
                    VALUES (?, ?, ?, ?)""",
                 (session_id, source, model, time.time()),
-            )
-        self._execute_write(_do)
-
-    def set_token_counts(
-        self,
-        session_id: str,
-        input_tokens: int = 0,
-        output_tokens: int = 0,
-        model: str = None,
-        cache_read_tokens: int = 0,
-        cache_write_tokens: int = 0,
-        reasoning_tokens: int = 0,
-        estimated_cost_usd: Optional[float] = None,
-        actual_cost_usd: Optional[float] = None,
-        cost_status: Optional[str] = None,
-        cost_source: Optional[str] = None,
-        pricing_version: Optional[str] = None,
-        billing_provider: Optional[str] = None,
-        billing_base_url: Optional[str] = None,
-        billing_mode: Optional[str] = None,
-    ) -> None:
-        """Set token counters to absolute values (not increment).
-
-        Use this when the caller provides cumulative totals from a completed
-        conversation run (e.g. the gateway, where the cached agent's
-        session_prompt_tokens already reflects the running total).
-        """
-        def _do(conn):
-            conn.execute(
-                """UPDATE sessions SET
-                   input_tokens = ?,
-                   output_tokens = ?,
-                   cache_read_tokens = ?,
-                   cache_write_tokens = ?,
-                   reasoning_tokens = ?,
-                   estimated_cost_usd = ?,
-                   actual_cost_usd = CASE
-                       WHEN ? IS NULL THEN actual_cost_usd
-                       ELSE ?
-                   END,
-                   cost_status = COALESCE(?, cost_status),
-                   cost_source = COALESCE(?, cost_source),
-                   pricing_version = COALESCE(?, pricing_version),
-                   billing_provider = COALESCE(billing_provider, ?),
-                   billing_base_url = COALESCE(billing_base_url, ?),
-                   billing_mode = COALESCE(billing_mode, ?),
-                   model = COALESCE(model, ?)
-                   WHERE id = ?""",
-                (
-                    input_tokens,
-                    output_tokens,
-                    cache_read_tokens,
-                    cache_write_tokens,
-                    reasoning_tokens,
-                    estimated_cost_usd,
-                    actual_cost_usd,
-                    actual_cost_usd,
-                    cost_status,
-                    cost_source,
-                    pricing_version,
-                    billing_provider,
-                    billing_base_url,
-                    billing_mode,
-                    model,
-                    session_id,
-                ),
             )
         self._execute_write(_do)
 
@@ -794,6 +720,7 @@ class SessionDB:
         exclude_sources: List[str] = None,
         limit: int = 20,
         offset: int = 0,
+        include_children: bool = False,
     ) -> List[Dict[str, Any]]:
         """List sessions with preview (first user message) and last active timestamp.
 
@@ -802,9 +729,15 @@ class SessionDB:
         last_active (timestamp of last message).
 
         Uses a single query with correlated subqueries instead of N+2 queries.
+
+        By default, child sessions (subagent runs, compression continuations)
+        are excluded.  Pass ``include_children=True`` to include them.
         """
         where_clauses = []
         params = []
+
+        if not include_children:
+            where_clauses.append("s.parent_session_id IS NULL")
 
         if source:
             where_clauses.append("s.source = ?")
@@ -945,7 +878,8 @@ class SessionDB:
                 try:
                     msg["tool_calls"] = json.loads(msg["tool_calls"])
                 except (json.JSONDecodeError, TypeError):
-                    pass
+                    logger.warning("Failed to deserialize tool_calls in get_messages, falling back to []")
+                    msg["tool_calls"] = []
             result.append(msg)
         return result
 
@@ -973,7 +907,8 @@ class SessionDB:
                 try:
                     msg["tool_calls"] = json.loads(row["tool_calls"])
                 except (json.JSONDecodeError, TypeError):
-                    pass
+                    logger.warning("Failed to deserialize tool_calls in conversation replay, falling back to []")
+                    msg["tool_calls"] = []
             # Restore reasoning fields on assistant messages so providers
             # that replay reasoning (OpenRouter, OpenAI, Nous) receive
             # coherent multi-turn reasoning context.
@@ -984,12 +919,14 @@ class SessionDB:
                     try:
                         msg["reasoning_details"] = json.loads(row["reasoning_details"])
                     except (json.JSONDecodeError, TypeError):
-                        pass
+                        logger.warning("Failed to deserialize reasoning_details, falling back to None")
+                        msg["reasoning_details"] = None
                 if row["codex_reasoning_items"]:
                     try:
                         msg["codex_reasoning_items"] = json.loads(row["codex_reasoning_items"])
                     except (json.JSONDecodeError, TypeError):
-                        pass
+                        logger.warning("Failed to deserialize codex_reasoning_items, falling back to None")
+                        msg["codex_reasoning_items"] = None
             messages.append(msg)
         return messages
 
@@ -1049,6 +986,22 @@ class SessionDB:
             sanitized = sanitized.replace(f"\x00Q{i}\x00", quoted)
 
         return sanitized.strip()
+
+
+    @staticmethod
+    def _contains_cjk(text: str) -> bool:
+        """Check if text contains CJK (Chinese, Japanese, Korean) characters."""
+        for ch in text:
+            cp = ord(ch)
+            if (0x4E00 <= cp <= 0x9FFF or    # CJK Unified Ideographs
+                0x3400 <= cp <= 0x4DBF or    # CJK Extension A
+                0x20000 <= cp <= 0x2A6DF or  # CJK Extension B
+                0x3000 <= cp <= 0x303F or    # CJK Symbols
+                0x3040 <= cp <= 0x309F or    # Hiragana
+                0x30A0 <= cp <= 0x30FF or    # Katakana
+                0xAC00 <= cp <= 0xD7AF):     # Hangul Syllables
+                return True
+        return False
 
     def search_messages(
         self,
@@ -1125,8 +1078,47 @@ class SessionDB:
                 cursor = self._conn.execute(sql, params)
             except sqlite3.OperationalError:
                 # FTS5 query syntax error despite sanitization — return empty
-                return []
-            matches = [dict(row) for row in cursor.fetchall()]
+                # unless query contains CJK (fall back to LIKE below)
+                if not self._contains_cjk(query):
+                    return []
+                matches = []
+            else:
+                matches = [dict(row) for row in cursor.fetchall()]
+
+        # LIKE fallback for CJK queries: FTS5 default tokenizer splits CJK
+        # characters individually, causing multi-character queries to fail.
+        if not matches and self._contains_cjk(query):
+            raw_query = query.strip('"').strip()
+            like_where = ["m.content LIKE ?"]
+            like_params: list = [f"%{raw_query}%"]
+            if source_filter is not None:
+                like_where.append(f"s.source IN ({','.join('?' for _ in source_filter)})")
+                like_params.extend(source_filter)
+            if exclude_sources is not None:
+                like_where.append(f"s.source NOT IN ({','.join('?' for _ in exclude_sources)})")
+                like_params.extend(exclude_sources)
+            if role_filter:
+                like_where.append(f"m.role IN ({','.join('?' for _ in role_filter)})")
+                like_params.extend(role_filter)
+            like_sql = f"""
+                SELECT m.id, m.session_id, m.role,
+                       substr(m.content,
+                              max(1, instr(m.content, ?) - 40),
+                              120) AS snippet,
+                       m.content, m.timestamp, m.tool_name,
+                       s.source, s.model, s.started_at AS session_started
+                FROM messages m
+                JOIN sessions s ON s.id = m.session_id
+                WHERE {' AND '.join(like_where)}
+                ORDER BY m.timestamp DESC
+                LIMIT ? OFFSET ?
+            """
+            like_params.extend([limit, offset])
+            # instr() parameter goes first in the bound list
+            like_params = [raw_query] + like_params
+            with self._lock:
+                like_cursor = self._conn.execute(like_sql, like_params)
+                matches = [dict(row) for row in like_cursor.fetchall()]
 
         # Add surrounding context (1 message before + after each match).
         # Done outside the lock so we don't hold it across N sequential queries.
@@ -1236,22 +1228,35 @@ class SessionDB:
         self._execute_write(_do)
 
     def delete_session(self, session_id: str) -> bool:
-        """Delete a session and all its messages. Returns True if found."""
+        """Delete a session and all its messages.
+
+        Child sessions are orphaned (parent_session_id set to NULL) rather
+        than cascade-deleted, so they remain accessible independently.
+        Returns True if the session was found and deleted.
+        """
         def _do(conn):
             cursor = conn.execute(
                 "SELECT COUNT(*) FROM sessions WHERE id = ?", (session_id,)
             )
             if cursor.fetchone()[0] == 0:
                 return False
+            # Orphan child sessions so FK constraint is satisfied
+            conn.execute(
+                "UPDATE sessions SET parent_session_id = NULL "
+                "WHERE parent_session_id = ?",
+                (session_id,),
+            )
             conn.execute("DELETE FROM messages WHERE session_id = ?", (session_id,))
             conn.execute("DELETE FROM sessions WHERE id = ?", (session_id,))
             return True
         return self._execute_write(_do)
 
     def prune_sessions(self, older_than_days: int = 90, source: str = None) -> int:
-        """
-        Delete sessions older than N days. Returns count of deleted sessions.
-        Only prunes ended sessions (not active ones).
+        """Delete sessions older than N days. Returns count of deleted sessions.
+
+        Only prunes ended sessions (not active ones).  Child sessions outside
+        the prune window are orphaned (parent_session_id set to NULL) rather
+        than cascade-deleted.
         """
         cutoff = time.time() - (older_than_days * 86400)
 
@@ -1267,7 +1272,18 @@ class SessionDB:
                     "SELECT id FROM sessions WHERE started_at < ? AND ended_at IS NOT NULL",
                     (cutoff,),
                 )
-            session_ids = [row["id"] for row in cursor.fetchall()]
+            session_ids = set(row["id"] for row in cursor.fetchall())
+
+            if not session_ids:
+                return 0
+
+            # Orphan any sessions whose parent is about to be deleted
+            placeholders = ",".join("?" * len(session_ids))
+            conn.execute(
+                f"UPDATE sessions SET parent_session_id = NULL "
+                f"WHERE parent_session_id IN ({placeholders})",
+                list(session_ids),
+            )
 
             for sid in session_ids:
                 conn.execute("DELETE FROM messages WHERE session_id = ?", (sid,))
