@@ -105,7 +105,7 @@ from agent.trajectory import (
     convert_scratchpad_to_think, has_incomplete_scratchpad,
     save_trajectory as _save_trajectory_to_file,
 )
-from utils import atomic_json_write
+from utils import atomic_json_write, env_var_enabled
 
 
 
