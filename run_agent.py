@@ -870,6 +870,16 @@ class AIAgent:
         self._interrupt_thread_signal_pending = False
         self._client_lock = threading.RLock()
 
+        # /steer mechanism — inject a user note into the next tool result
+        # without interrupting the agent. Unlike interrupt(), steer() does
+        # NOT set _interrupt_requested; it waits for the current tool batch
+        # to finish naturally, then the drain hook appends the text to the
+        # last tool result's content so the model sees it on its next
+        # iteration. Message-role alternation is preserved (we modify an
+        # existing tool message rather than inserting a new user turn).
+        self._pending_steer: Optional[str] = None
+        self._pending_steer_lock = threading.Lock()
+
         # Concurrent-tool worker thread tracking.  `_execute_tool_calls_concurrent`
         # runs each tool on its own ThreadPoolExecutor worker — those worker
         # threads have tids distinct from `_execution_thread_id`, so
@@ -3287,8 +3297,150 @@ class AIAgent:
         """Clear any pending interrupt request and the per-thread tool interrupt signal."""
         self._interrupt_requested = False
         self._interrupt_message = None
-        _set_interrupt(False, self._execution_thread_id)
-=======
+        self._interrupt_thread_signal_pending = False
+        if self._execution_thread_id is not None:
+            _set_interrupt(False, self._execution_thread_id)
+        # Also clear any concurrent-tool worker thread bits.  Tracked
+        # workers normally clear their own bit on exit, but an explicit
+        # clear here guarantees no stale interrupt can survive a turn
+        # boundary and fire on a subsequent, unrelated tool call that
+        # happens to get scheduled onto the same recycled worker tid.
+        # `getattr` fallback covers test stubs that build AIAgent via
+        # object.__new__ and skip __init__.
+        _tracker = getattr(self, "_tool_worker_threads", None)
+        _tracker_lock = getattr(self, "_tool_worker_threads_lock", None)
+        if _tracker is not None and _tracker_lock is not None:
+            with _tracker_lock:
+                _worker_tids = list(_tracker)
+            for _wtid in _worker_tids:
+                try:
+                    _set_interrupt(False, _wtid)
+                except Exception:
+                    pass
+        # A hard interrupt supersedes any pending /steer — the steer was
+        # meant for the agent's next tool-call iteration, which will no
+        # longer happen. Drop it instead of surprising the user with a
+        # late injection on the post-interrupt turn.
+        _steer_lock = getattr(self, "_pending_steer_lock", None)
+        if _steer_lock is not None:
+            with _steer_lock:
+                self._pending_steer = None
+
+    def steer(self, text: str) -> bool:
+        """
+        Inject a user message into the next tool result without interrupting.
+
+        Unlike interrupt(), this does NOT stop the current tool call. The
+        text is stashed and the agent loop appends it to the LAST tool
+        result's content once the current tool batch finishes. The model
+        sees the steer as part of the tool output on its next iteration.
+
+        Thread-safe: callable from gateway/CLI/TUI threads. Multiple calls
+        before the drain point concatenate with newlines.
+
+        Args:
+            text: The user text to inject. Empty strings are ignored.
+
+        Returns:
+            True if the steer was accepted, False if the text was empty.
+        """
+        if not text or not text.strip():
+            return False
+        cleaned = text.strip()
+        _lock = getattr(self, "_pending_steer_lock", None)
+        if _lock is None:
+            # Test stubs that built AIAgent via object.__new__ skip __init__.
+            # Fall back to direct attribute set; no concurrent callers expected
+            # in those stubs.
+            existing = getattr(self, "_pending_steer", None)
+            self._pending_steer = (existing + "\n" + cleaned) if existing else cleaned
+            return True
+        with _lock:
+            if self._pending_steer:
+                self._pending_steer = self._pending_steer + "\n" + cleaned
+            else:
+                self._pending_steer = cleaned
+        return True
+
+    def _drain_pending_steer(self) -> Optional[str]:
+        """Return the pending steer text (if any) and clear the slot.
+
+        Safe to call from the agent execution thread after appending tool
+        results. Returns None when no steer is pending.
+        """
+        _lock = getattr(self, "_pending_steer_lock", None)
+        if _lock is None:
+            text = getattr(self, "_pending_steer", None)
+            self._pending_steer = None
+            return text
+        with _lock:
+            text = self._pending_steer
+            self._pending_steer = None
+        return text
+
+    def _apply_pending_steer_to_tool_results(self, messages: list, num_tool_msgs: int) -> None:
+        """Append any pending /steer text to the last tool result in this turn.
+
+        Called at the end of a tool-call batch, before the next API call.
+        The steer is appended to the last ``role:"tool"`` message's content
+        with a clear marker so the model understands it came from the user
+        and NOT from the tool itself. Role alternation is preserved —
+        nothing new is inserted, we only modify existing content.
+
+        Args:
+            messages: The running messages list.
+            num_tool_msgs: Number of tool results appended in this batch;
+                used to locate the tail slice safely.
+        """
+        if num_tool_msgs <= 0 or not messages:
+            return
+        steer_text = self._drain_pending_steer()
+        if not steer_text:
+            return
+        # Find the last tool-role message in the recent tail. Skipping
+        # non-tool messages defends against future code appending
+        # something else at the boundary.
+        target_idx = None
+        for j in range(len(messages) - 1, max(len(messages) - num_tool_msgs - 1, -1), -1):
+            msg = messages[j]
+            if isinstance(msg, dict) and msg.get("role") == "tool":
+                target_idx = j
+                break
+        if target_idx is None:
+            # No tool result in this batch (e.g. all skipped by interrupt);
+            # put the steer back so the caller's fallback path can deliver
+            # it as a normal next-turn user message.
+            _lock = getattr(self, "_pending_steer_lock", None)
+            if _lock is not None:
+                with _lock:
+                    if self._pending_steer:
+                        self._pending_steer = self._pending_steer + "\n" + steer_text
+                    else:
+                        self._pending_steer = steer_text
+            else:
+                existing = getattr(self, "_pending_steer", None)
+                self._pending_steer = (existing + "\n" + steer_text) if existing else steer_text
+            return
+        marker = f"\n\n[USER STEER (injected mid-run, not tool output): {steer_text}]"
+        existing_content = messages[target_idx].get("content", "")
+        if not isinstance(existing_content, str):
+            # Anthropic multimodal content blocks — preserve them and append
+            # a text block at the end.
+            try:
+                blocks = list(existing_content) if existing_content else []
+                blocks.append({"type": "text", "text": marker.lstrip()})
+                messages[target_idx]["content"] = blocks
+            except Exception:
+                # Fall back to string replacement if content shape is unexpected.
+                messages[target_idx]["content"] = f"{existing_content}{marker}"
+        else:
+            messages[target_idx]["content"] = existing_content + marker
+        logger.info(
+            "Delivered /steer to agent after tool batch (%d chars): %s",
+            len(steer_text),
+            steer_text[:120] + ("..." if len(steer_text) > 120 else ""),
+        )
+>>>>>>> upstream/main
 
     def _touch_activity(self, desc: str) -> None:
         """Update the last-activity timestamp and description (thread-safe)."""
@@ -7994,6 +8146,13 @@ class AIAgent:
                 tier = "⚠️  WARNING" if remaining <= self.max_iterations * 0.1 else "💡 CAUTION"
                 print(f"{self.log_prefix}{tier}: {remaining} iterations remaining")
 
+        # ── /steer injection ──────────────────────────────────────────────
+        # Append any pending user steer text to the last tool result so the
+        # agent sees it on its next iteration. Runs AFTER budget enforcement
+        # so the steer marker is never truncated. See steer() for details.
+        if num_tools > 0:
+            self._apply_pending_steer_to_tool_results(messages, num_tools)
+
         # ── Tool-repeat batching hint ─────────────────────────────────────
         iteration_tool_names = [r[0] for r in results if r is not None]
         self._inject_tool_repeat_hint(iteration_tool_names, messages)
@@ -8376,6 +8535,12 @@ class AIAgent:
         num_tools_seq = len(assistant_message.tool_calls)
         if num_tools_seq > 0:
             enforce_turn_budget(messages[-num_tools_seq:], env=get_active_env(effective_task_id))
+
+        # ── /steer injection ──────────────────────────────────────────────
+        # See _execute_tool_calls_parallel for the rationale. Same hook,
+        # applied to sequential execution as well.
+        if num_tools_seq > 0:
+            self._apply_pending_steer_to_tool_results(messages, num_tools_seq)
 
 
         # ── Tool-repeat batching hint ─────────────────────────────────────
@@ -11746,6 +11911,12 @@ class AIAgent:
             "tool_repeat_hints_fired": getattr(self, "_tool_repeat_hints_fired", 0),
             "tool_repeat_hints_complied": getattr(self, "_tool_repeat_hints_complied", 0),
         }
+        # If a /steer landed after the final assistant turn (no more tool
+        # batches to drain into), hand it back to the caller so it can be
+        # delivered as the next user turn instead of being silently lost.
+        _leftover_steer = self._drain_pending_steer()
+        if _leftover_steer:
+            result["pending_steer"] = _leftover_steer
         self._response_was_previewed = False
         
         # Include interrupt message if one triggered the interrupt
