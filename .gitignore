@@ -60,6 +60,7 @@ mini-swe-agent/
 
 # Nix
 .direnv/
+.nix-stamps/
 result
 .gitnexus
 website/static/api/skills-index.json

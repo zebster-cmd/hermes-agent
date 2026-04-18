@@ -21,11 +21,15 @@ const sidebars: SidebarsConfig = {
       collapsed: true,
       items: [
         'user-guide/cli',
+        'user-guide/tui',
         'user-guide/configuration',
         'user-guide/sessions',
+<<<<<<< HEAD
         'user-guide/profiles',
         'user-guide/git-worktrees',
         'user-guide/docker',
+=======
+>>>>>>> origin/live
         'user-guide/security',
         'user-guide/checkpoints-and-rollback',
       ],
@@ -36,6 +40,10 @@ const sidebars: SidebarsConfig = {
       collapsed: true,
       items: [
         'user-guide/features/overview',
+<<<<<<< HEAD
+=======
+        'user-guide/features/tool-gateway',
+>>>>>>> origin/live
         {
           type: 'category',
           label: 'Core',
@@ -78,6 +86,10 @@ const sidebars: SidebarsConfig = {
           label: 'Management',
           items: [
             'user-guide/features/web-dashboard',
+<<<<<<< HEAD
+=======
+            'user-guide/features/dashboard-plugins',
+>>>>>>> origin/live
           ],
         },
         {
@@ -92,6 +104,7 @@ const sidebars: SidebarsConfig = {
           label: 'Skills',
           items: [
             'user-guide/skills/godmode',
+            'user-guide/skills/google-workspace',
           ],
         },
       ],
@@ -136,6 +149,7 @@ const sidebars: SidebarsConfig = {
         'user-guide/features/honcho',
         'user-guide/features/provider-routing',
         'user-guide/features/fallback-providers',
+        'user-guide/features/credential-pools',
       ],
     },
     {
@@ -153,10 +167,12 @@ const sidebars: SidebarsConfig = {
         'guides/use-voice-mode-with-hermes',
         'guides/build-a-hermes-plugin',
         'guides/automate-with-cron',
+        'guides/automation-templates',
         'guides/cron-troubleshooting',
         'guides/work-with-skills',
         'guides/delegation-patterns',
         'guides/migrate-from-openclaw',
+        'guides/aws-bedrock',
       ],
     },
     {
