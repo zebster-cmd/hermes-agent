@@ -164,11 +164,11 @@ async def preprocess_context_references_async(
             blocks.append(block)
             injected_tokens += estimate_tokens_rough(block)
 
-    hard_limit = max(1, int(context_length * 0.50))
+    hard_limit = max(1, int(context_length * 0.75))
     soft_limit = max(1, int(context_length * 0.25))
     if injected_tokens > hard_limit:
         warnings.append(
-            f"@ context injection refused: {injected_tokens} tokens exceeds the 50% hard limit ({hard_limit})."
+            f"@ context injection refused: {injected_tokens} tokens exceeds the 75% hard limit ({hard_limit})."
         )
         return ContextReferenceResult(
             message=message,

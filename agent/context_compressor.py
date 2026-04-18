@@ -233,7 +233,7 @@ class ContextCompressor(ContextEngine):
     def __init__(
         self,
         model: str,
-        threshold_percent: float = 0.50,
+        threshold_percent: float = 0.75,
         protect_first_n: int = 3,
         protect_last_n: int = 20,
         summary_target_ratio: float = 0.20,
@@ -263,7 +263,7 @@ class ContextCompressor(ContextEngine):
         )
         # Floor: never compress below MINIMUM_CONTEXT_LENGTH tokens even if
         # the percentage would suggest a lower value.  This prevents premature
-        # compression on large-context models at 50% while keeping the % sane
+        # compression on large-context models at 75% while keeping the % sane
         # for models right at the minimum.
         self.threshold_tokens = max(
             int(self.context_length * threshold_percent),
