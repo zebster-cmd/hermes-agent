@@ -535,6 +535,8 @@ class HonchoMemoryProvider(MemoryProvider):
 
                 elif action == "set":
                     facts = args.get("facts", [])
+                    if isinstance(facts, str):
+                        facts = [facts]
                     if not facts:
                         return json.dumps({"error": "Missing 'facts' list for set action."})
                     if len(facts) > 40:
@@ -544,6 +546,8 @@ class HonchoMemoryProvider(MemoryProvider):
 
                 elif action == "add":
                     facts = args.get("facts", [])
+                    if isinstance(facts, str):
+                        facts = [facts]
                     if not facts:
                         return json.dumps({"error": "Missing 'facts' list for add action."})
                     existing = peer.get_card(target=target) or []
