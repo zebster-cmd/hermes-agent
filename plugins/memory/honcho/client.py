@@ -258,6 +258,11 @@ class HonchoClientConfig:
     # matching dialectic_depth length. When None, uses proportional defaults
     # derived from dialectic_reasoning_level.
     dialectic_depth_levels: list[str] | None = None
+    # When true, the auto-injected dialectic scales reasoning level up on
+    # longer queries. See HonchoMemoryProvider for thresholds.
+    reasoning_heuristic: bool = True
+    # Ceiling for the heuristic-selected reasoning level.
+    reasoning_level_cap: str = "high"
     # Honcho API limits — configurable for self-hosted instances
     # Max chars per message sent via add_messages() (Honcho cloud: 25000)
     message_max_chars: int = 25000
@@ -308,12 +313,8 @@ class HonchoClientConfig:
             api_key=api_key,
             environment=os.environ.get("HONCHO_ENVIRONMENT", "production"),
             base_url=base_url,
-<<<<<<< HEAD
             ai_peer=_sanitize_peer_id(resolved_host),
-=======
             timeout=timeout,
-            ai_peer=resolved_host,
->>>>>>> origin/live
             enabled=bool(api_key or base_url),
         )
 
@@ -373,14 +374,7 @@ class HonchoClientConfig:
             or os.environ.get("HONCHO_BASE_URL", "").strip()
             or None
         )
-<<<<<<< HEAD
-=======
-        timeout = _resolve_optional_float(
-            raw.get("timeout"),
-            raw.get("requestTimeout"),
-            os.environ.get("HONCHO_TIMEOUT"),
-        )
->>>>>>> origin/live
+
 
         # Auto-enable when API key or base_url is present (unless explicitly disabled)
         # Host-level enabled wins, then root-level, then auto-enable if key/url exists.
@@ -459,6 +453,16 @@ class HonchoClientConfig:
                 host_block.get("dialecticDepthLevels"),
                 raw.get("dialecticDepthLevels"),
                 depth=_parse_dialectic_depth(host_block.get("dialecticDepth"), raw.get("dialecticDepth")),
+            ),
+            reasoning_heuristic=_resolve_bool(
+                host_block.get("reasoningHeuristic"),
+                raw.get("reasoningHeuristic"),
+                default=True,
+            ),
+            reasoning_level_cap=(
+                host_block.get("reasoningLevelCap")
+                or raw.get("reasoningLevelCap")
+                or "high"
             ),
             message_max_chars=int(
                 host_block.get("messageMaxChars")
@@ -635,17 +639,7 @@ def get_honcho_client(config: HonchoClientConfig | None = None) -> Honcho:
             hermes_cfg = load_config()
             honcho_cfg = hermes_cfg.get("honcho", {})
             if isinstance(honcho_cfg, dict):
-<<<<<<< HEAD
                 resolved_base_url = honcho_cfg.get("base_url", "").strip() or None
-=======
-                if not resolved_base_url:
-                    resolved_base_url = honcho_cfg.get("base_url", "").strip() or None
-                if resolved_timeout is None:
-                    resolved_timeout = _resolve_optional_float(
-                        honcho_cfg.get("timeout"),
-                        honcho_cfg.get("request_timeout"),
-                    )
->>>>>>> origin/live
         except Exception:
             pass
 

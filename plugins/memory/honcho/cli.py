@@ -440,8 +440,60 @@ def cmd_setup(args) -> None:
     if new_recall in ("hybrid", "context", "tools"):
         hermes_host["recallMode"] = new_recall
 
-    # --- 7. Session strategy ---
-    current_strat = hermes_host.get("sessionStrategy") or cfg.get("sessionStrategy", "per-directory")
+   # --- 7. Context token budget ---
+    current_ctx_tokens = hermes_host.get("contextTokens") or cfg.get("contextTokens")
+    current_display = str(current_ctx_tokens) if current_ctx_tokens else "uncapped"
+    print("\n  Context injection per turn (hybrid/context recall modes only):")
+    print("    uncapped -- no limit (default)")
+    print("    N        -- token limit per turn (e.g. 1200)")
+    new_ctx_tokens = _prompt("Context tokens", default=current_display)
+    if new_ctx_tokens.strip().lower() in ("none", "uncapped", "no limit"):
+        hermes_host.pop("contextTokens", None)
+    elif new_ctx_tokens.strip() == "":
+        pass  # keep current
+    else:
+        try:
+            val = int(new_ctx_tokens)
+            if val >= 0:
+                hermes_host["contextTokens"] = val
+        except (ValueError, TypeError):
+            pass  # keep current
+
+    # --- 7b. Dialectic cadence ---
+    current_dialectic = str(hermes_host.get("dialecticCadence") or cfg.get("dialecticCadence") or "2")
+    print("\n  Dialectic cadence:")
+    print("    How often Honcho rebuilds its user model (LLM call on Honcho backend).")
+    print("    1 = every turn, 2 = every other turn, 3+ = sparser.")
+    print("    Recommended: 1-5.")
+    new_dialectic = _prompt("Dialectic cadence", default=current_dialectic)
+    try:
+        val = int(new_dialectic)
+        if val >= 1:
+            hermes_host["dialecticCadence"] = val
+    except (ValueError, TypeError):
+        hermes_host["dialecticCadence"] = 2
+
+    # --- 7c. Dialectic reasoning level ---
+    current_reasoning = (
+        hermes_host.get("dialecticReasoningLevel")
+        or cfg.get("dialecticReasoningLevel")
+        or "low"
+    )
+    print("\n  Dialectic reasoning level:")
+    print("    Depth Honcho uses when synthesizing user context on auto-injected calls.")
+    print("    minimal  -- quick factual lookups")
+    print("    low      -- straightforward questions (default)")
+    print("    medium   -- multi-aspect synthesis")
+    print("    high     -- complex behavioral patterns")
+    print("    max      -- thorough audit-level analysis")
+    new_reasoning = _prompt("Reasoning level", default=current_reasoning)
+    if new_reasoning in ("minimal", "low", "medium", "high", "max"):
+        hermes_host["dialecticReasoningLevel"] = new_reasoning
+    else:
+        hermes_host["dialecticReasoningLevel"] = "low"
+
+    # --- 8. Session strategy ---
+    current_strat = hermes_host.get("sessionStrategy") or cfg.get("sessionStrategy", "per-session")
     print("\n  Session strategy:")
     print("    per-directory -- one session per working directory (default)")
     print("    per-session   -- new Honcho session each run")
@@ -592,6 +644,13 @@ def cmd_status(args) -> None:
     print(f"  User peer:      {hcfg.peer_name or 'not set'}")
     print(f"  Session key:    {hcfg.resolve_session_name()}")
     print(f"  Recall mode:    {hcfg.recall_mode}")
+    print(f"  Context budget: {hcfg.context_tokens or '(uncapped)'} tokens")
+    raw = getattr(hcfg, "raw", None) or {}
+    dialectic_cadence = raw.get("dialecticCadence") or 1
+    print(f"  Dialectic cad:  every {dialectic_cadence} turn{'s' if dialectic_cadence != 1 else ''}")
+    reasoning_cap = raw.get("reasoningLevelCap") or hcfg.reasoning_level_cap
+    heuristic_on = "on" if hcfg.reasoning_heuristic else "off"
+    print(f"  Reasoning:      base={hcfg.dialectic_reasoning_level}, cap={reasoning_cap}, heuristic={heuristic_on}")
     print(f"  Observation:    user(me={hcfg.user_observe_me},others={hcfg.user_observe_others}) ai(me={hcfg.ai_observe_me},others={hcfg.ai_observe_others})")
     print(f"  Write freq:     {hcfg.write_frequency}")
 
