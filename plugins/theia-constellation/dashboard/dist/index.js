@@ -171,7 +171,24 @@
     }, []);
 
     var handleFullscreen = useCallback(function () {
-      setIsFullscreen(function (prev) { return !prev; });
+      if (!document.fullscreenElement) {
+        if (containerRef.current) {
+          containerRef.current.requestFullscreen().catch(function () {});
+        }
+      } else {
+        document.exitFullscreen().catch(function () {});
+      }
+    }, []);
+
+    // Sync React state with the browser fullscreen API
+    useEffect(function () {
+      function onFsChange() {
+        setIsFullscreen(!!document.fullscreenElement);
+      }
+      document.addEventListener("fullscreenchange", onFsChange);
+      return function () {
+        document.removeEventListener("fullscreenchange", onFsChange);
+      };
     }, []);
 
     var handlePopout = useCallback(function () {
@@ -195,32 +212,7 @@
           panelInfo.env.toUpperCase())
       : null;
 
-    // Full-screen mode
-    if (isFullscreen) {
-      return h("div", {
-        ref: containerRef,
-        className: "theia-fullscreen",
-      },
-        h("div", { className: "theia-fullscreen-toolbar" },
-          h("span", { className: "text-xs font-mondwest tracking-widest opacity-70" }, "THEIA CONSTELLATION"),
-          h("div", { className: "flex items-center gap-2" },
-            envBadge,
-            selectedNode && h(Badge, { variant: "outline", className: "text-xs" }, selectedNode),
-            h(Button, { variant: "outline", size: "sm", onClick: handleReload }, "Reload"),
-            h(Button, { variant: "outline", size: "sm", onClick: handleFullscreen }, "Exit Fullscreen")
-          )
-        ),
-        h("iframe", {
-          ref: iframeRef,
-          src: iframeSrc,
-          className: "theia-iframe-full",
-          allow: "accelerometer; autoplay",
-          sandbox: "allow-scripts allow-same-origin",
-        })
-      );
-    }
-
-    // Normal mode
+    // Normal mode — containerRef wraps the iframe so fullscreen targets it
     return h("div", { className: "flex flex-col gap-6" },
 
       // Header
