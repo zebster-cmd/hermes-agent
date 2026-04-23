@@ -4003,12 +4003,13 @@ void main() {
       <div>${Math.round(a.duration_sec)}s · ${a.tool_count} tools</div>
     `,e.style.left=`${o}px`,e.style.top=`${l}px`,e.style.opacity="1"}function r(){e.style.opacity="0"}function s(){i.removeChild(e)}return{show:n,hide:r,dispose:s}}function Vg(i){return i.replace(/[&<>"]/g,t=>({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;"})[t])}function Gg(i,t,e,n){const r=document.createElement("div");r.style.cssText=`
     position: absolute; top: 12px; left: 12px;
-    display: flex; gap: 12px;
-    padding: 8px 12px; background: ${Is(n,.75)};
-    border: 1px solid #${n.border}; border-radius: var(--theia-radius, 6px);
-    font: 12px/1.4 var(--theia-font, ui-monospace, monospace); color: #${n.fg};
-    user-select: none;
-  `;const s=["memory-share","cross-search","tool-overlap"],a=new Set(t);for(const o of s){const l=document.createElement("label");l.style.cssText="display:flex;gap:6px;align-items:center;cursor:pointer";const c=document.createElement("input");c.type="checkbox",c.checked=a.has(o),c.onchange=()=>{c.checked?a.add(o):a.delete(o),e(new Set(a))},l.append(c,document.createTextNode(o)),r.append(l)}return i.appendChild(r),{dispose:()=>i.removeChild(r)}}function kg(i,t){const e=document.createElement("aside");e.style.cssText=`
+    display: flex; gap: 14px;
+    padding: 6px 14px; background: ${Is(n,.85)};
+    border: 1px solid #${n.border}; border-radius: var(--theia-radius, 4px);
+    font: 10px/1.4 'Mondwest', var(--theia-font, ui-monospace, monospace); letter-spacing: 0.1em;
+    color: #${n.fg}; text-transform: uppercase;
+    user-select: none; backdrop-filter: blur(6px);
+  `;const s=["memory-share","cross-search","tool-overlap"],a=new Set(t);for(const o of s){const l=document.createElement("label");l.style.cssText=`display:flex;gap:7px;align-items:center;cursor:pointer;transition:color 150ms;color:${a.has(o)?`#${n.fg}`:`#${n.fg2}`}`;l.onmouseenter=()=>{l.style.color=`#${n.accent}`};l.onmouseleave=()=>{l.style.color=a.has(o)?`#${n.fg}`:`#${n.fg2}`};const c=document.createElement("span");c.style.cssText=`display:inline-block;width:28px;height:14px;border-radius:7px;position:relative;transition:background 150ms;border:1px solid #${n.border};${a.has(o)?`background:#${n.accent}66`:`background:#${n.fg}14`}`;const f=document.createElement("span");f.style.cssText=`position:absolute;top:1px;width:10px;height:10px;border-radius:50%;transition:left 150ms,background 150ms;${a.has(o)?`left:15px;background:#${n.accent}`:`left:1px;background:#${n.fg2}`}`;c.appendChild(f);const d=()=>{const v=a.has(o);if(v)a.delete(o);else a.add(o);const on=!v;f.style.left=on?"15px":"1px";f.style.background=on?`#${n.accent}`:`#${n.fg2}`;c.style.background=on?`#${n.accent}66`:`#${n.fg}14`;l.style.color=on?`#${n.fg}`:`#${n.fg2}`;e(new Set(a))};l.onclick=d;l.append(c,document.createTextNode(o)),r.append(l)}return i.appendChild(r),{dispose:()=>i.removeChild(r)}}function kg(i,t){const e=document.createElement("aside");e.style.cssText=`
     position: absolute; top: 0; right: 0; bottom: 0; width: min(380px, 40vw);
     background: ${Is(t,.94)}; border-left: 1px solid #${t.border};
     color: #${t.fg}; font: 13px/1.5 var(--theia-font, ui-monospace, monospace);

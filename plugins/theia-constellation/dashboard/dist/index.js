@@ -93,7 +93,7 @@
   // -------------------------------------------------------------------
   var btnClass = cn(
     "inline-flex items-center gap-1.5 border border-border bg-background/40 px-3 py-1.5",
-    "text-xs font-courier transition-colors hover:bg-foreground/10 cursor-pointer"
+    "font-mondwest text-xs tracking-[0.1em] uppercase transition-colors hover:bg-foreground/10 cursor-pointer"
   );
 
   // -------------------------------------------------------------------
