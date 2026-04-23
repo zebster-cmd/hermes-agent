@@ -180,10 +180,21 @@
       }
     }, []);
 
-    // Sync React state with the browser fullscreen API
+    // Sync React state with the browser fullscreen API and
+    // nudge the iframe's three.js renderer to resize.
     useEffect(function () {
       function onFsChange() {
         setIsFullscreen(!!document.fullscreenElement);
+        // The iframe's ResizeObserver may miss the layout shift,
+        // so poke the iframe's contentWindow with a resize event
+        // after the browser has had a frame to reflow.
+        setTimeout(function () {
+          try {
+            if (iframeRef.current && iframeRef.current.contentWindow) {
+              iframeRef.current.contentWindow.dispatchEvent(new Event("resize"));
+            }
+          } catch (_) {}
+        }, 100);
       }
       document.addEventListener("fullscreenchange", onFsChange);
       return function () {
