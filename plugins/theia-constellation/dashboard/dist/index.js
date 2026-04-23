@@ -88,15 +88,6 @@
     return parts.join("&");
   }
 
-  // -------------------------------------------------------------------
-  // Styles (inline — matches dashboard theme)
-  // -------------------------------------------------------------------
-  var btnClass = cn(
-    "inline-flex items-center justify-center gap-2 whitespace-nowrap",
-    "font-mondwest text-[0.65rem] tracking-[0.1em] uppercase",
-    "border border-border bg-transparent hover:bg-foreground/10 hover:text-foreground",
-    "h-8 px-3 transition-colors cursor-pointer"
-  );
 
   // -------------------------------------------------------------------
   // Helper: resolve panel URL based on env
@@ -215,8 +206,8 @@
           h("div", { className: "flex items-center gap-2" },
             envBadge,
             selectedNode && h(Badge, { variant: "outline", className: "text-xs" }, selectedNode),
-            h(Button, { onClick: handleReload, className: btnClass }, "Reload"),
-            h(Button, { onClick: handleFullscreen, className: btnClass }, "Exit Fullscreen")
+            h(Button, { variant: "outline", size: "sm", onClick: handleReload }, "Reload"),
+            h(Button, { variant: "outline", size: "sm", onClick: handleFullscreen }, "Exit Fullscreen")
           )
         ),
         h("iframe", {
@@ -245,9 +236,9 @@
               )
             ),
             h("div", { className: "flex items-center gap-2" },
-              h(Button, { onClick: handleReload, className: btnClass }, "Reload"),
-              h(Button, { onClick: handleFullscreen, className: btnClass }, "Fullscreen"),
-              h(Button, { onClick: handlePopout, className: btnClass }, "Pop Out")
+              h(Button, { variant: "outline", size: "sm", onClick: handleReload }, "Reload"),
+              h(Button, { variant: "outline", size: "sm", onClick: handleFullscreen }, "Fullscreen"),
+              h(Button, { variant: "outline", size: "sm", onClick: handlePopout }, "Pop Out")
             )
           )
         ),
@@ -279,7 +270,7 @@
               onClick: function () {
                 window.location.hash = "#/sessions?id=" + selectedNode;
               },
-              className: btnClass,
+              variant: "outline", size: "sm",
             }, "View in Sessions")
           )
         )
