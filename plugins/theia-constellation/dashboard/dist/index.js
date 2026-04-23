@@ -92,8 +92,10 @@
   // Styles (inline — matches dashboard theme)
   // -------------------------------------------------------------------
   var btnClass = cn(
-    "inline-flex items-center gap-1.5 border border-border bg-background/40 px-3 py-1.5",
-    "font-mondwest text-xs tracking-[0.1em] uppercase transition-colors hover:bg-foreground/10 cursor-pointer"
+    "inline-flex items-center justify-center gap-2 whitespace-nowrap",
+    "font-mondwest text-[0.65rem] tracking-[0.1em] uppercase",
+    "border border-border bg-transparent hover:bg-foreground/10 hover:text-foreground",
+    "h-8 px-3 transition-colors cursor-pointer"
   );
 
   // -------------------------------------------------------------------
@@ -209,7 +211,7 @@
         className: "theia-fullscreen",
       },
         h("div", { className: "theia-fullscreen-toolbar" },
-          h("span", { className: "text-xs font-courier tracking-widest opacity-70" }, "THEIA CONSTELLATION"),
+          h("span", { className: "text-xs font-mondwest tracking-widest opacity-70" }, "THEIA CONSTELLATION"),
           h("div", { className: "flex items-center gap-2" },
             envBadge,
             selectedNode && h(Badge, { variant: "outline", className: "text-xs" }, selectedNode),
