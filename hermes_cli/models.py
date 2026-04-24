@@ -33,6 +33,8 @@ COPILOT_REASONING_EFFORTS_O_SERIES = ["low", "medium", "high"]
 # (model_id, display description shown in menus)
 OPENROUTER_MODELS: list[tuple[str, str]] = [
     ("moonshotai/kimi-k2.6",            "recommended"),
+    ("deepseek/deepseek-v4-pro",        ""),
+    ("deepseek/deepseek-v4-flash",      ""),
     ("anthropic/claude-opus-4.7",       ""),
     ("anthropic/claude-opus-4.6",       ""),
     ("anthropic/claude-sonnet-4.6",     ""),
@@ -109,6 +111,8 @@ def _codex_curated_models() -> list[str]:
 _PROVIDER_MODELS: dict[str, list[str]] = {
     "nous": [
         "moonshotai/kimi-k2.6",
+        "deepseek/deepseek-v4-pro",
+        "deepseek/deepseek-v4-flash",
         "xiaomi/mimo-v2.5-pro",
         "xiaomi/mimo-v2.5",
         "anthropic/claude-opus-4.7",
@@ -151,10 +155,13 @@ _PROVIDER_MODELS: dict[str, list[str]] = {
         "gpt-4.1",
         "gpt-4o",
         "gpt-4o-mini",
-        "claude-opus-4.6",
         "claude-sonnet-4.6",
+        "claude-sonnet-4",
         "claude-sonnet-4.5",
         "claude-haiku-4.5",
+        "gemini-3.1-pro-preview",
+        "gemini-3-pro-preview",
+        "gemini-3-flash-preview",
         "gemini-2.5-pro",
         "grok-code-fast-1",
     ],
@@ -246,6 +253,8 @@ _PROVIDER_MODELS: dict[str, list[str]] = {
         "claude-haiku-4-5-20251001",
     ],
     "deepseek": [
+        "deepseek-v4-pro",
+        "deepseek-v4-flash",
         "deepseek-chat",
         "deepseek-reasoner",
     ],
@@ -676,7 +685,7 @@ def get_nous_recommended_aux_model(
 # ---------------------------------------------------------------------------
 # Canonical provider list — single source of truth for provider identity.
 # Every code path that lists, displays, or iterates providers derives from
-# this list:  hermes model, /model, /provider, list_authenticated_providers.
+# this list:  hermes model, /model, list_authenticated_providers.
 #
 # Fields:
 #   slug        — internal provider ID (used in config.yaml, --provider flag)
@@ -1104,7 +1113,10 @@ def fetch_models_with_pricing(
         return _pricing_cache[cache_key]
 
     url = cache_key.rstrip("/") + "/v1/models"
-    headers: dict[str, str] = {"Accept": "application/json"}
+    headers: dict[str, str] = {
+        "Accept": "application/json",
+        "User-Agent": _HERMES_USER_AGENT,
+    }
     if api_key:
         headers["Authorization"] = f"Bearer {api_key}"
 
@@ -1923,6 +1935,7 @@ _COPILOT_MODEL_ALIASES = {
     "openai/o4-mini": "gpt-5-mini",
     "anthropic/claude-opus-4.6": "claude-opus-4.6",
     "anthropic/claude-sonnet-4.6": "claude-sonnet-4.6",
+    "anthropic/claude-sonnet-4": "claude-sonnet-4",
     "anthropic/claude-sonnet-4.5": "claude-sonnet-4.5",
     "anthropic/claude-haiku-4.5": "claude-haiku-4.5",
     # Dash-notation fallbacks: Hermes' default Claude IDs elsewhere use
@@ -1932,10 +1945,12 @@ _COPILOT_MODEL_ALIASES = {
     # "model_not_supported".  See issue #6879.
     "claude-opus-4-6": "claude-opus-4.6",
     "claude-sonnet-4-6": "claude-sonnet-4.6",
+    "claude-sonnet-4-0": "claude-sonnet-4",
     "claude-sonnet-4-5": "claude-sonnet-4.5",
     "claude-haiku-4-5": "claude-haiku-4.5",
     "anthropic/claude-opus-4-6": "claude-opus-4.6",
     "anthropic/claude-sonnet-4-6": "claude-sonnet-4.6",
+    "anthropic/claude-sonnet-4-0": "claude-sonnet-4",
     "anthropic/claude-sonnet-4-5": "claude-sonnet-4.5",
     "anthropic/claude-haiku-4-5": "claude-haiku-4.5",
 }
@@ -2235,7 +2250,10 @@ def _fetch_ai_gateway_models(timeout: float = 5.0) -> Optional[list[str]]:
         base_url = AI_GATEWAY_BASE_URL
 
     url = base_url.rstrip("/") + "/models"
-    headers: dict[str, str] = {"Authorization": f"Bearer {api_key}"}
+    headers: dict[str, str] = {
+        "Authorization": f"Bearer {api_key}",
+        "User-Agent": _HERMES_USER_AGENT,
+    }
     req = urllib.request.Request(url, headers=headers)
     try:
         with urllib.request.urlopen(req, timeout=timeout) as resp:

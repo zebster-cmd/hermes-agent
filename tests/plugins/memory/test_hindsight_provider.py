@@ -7,9 +7,8 @@ turn counting, tags), and schema completeness.
 
 import json
 import re
-import threading
 from types import SimpleNamespace
-from unittest.mock import AsyncMock, MagicMock, patch
+from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
@@ -249,6 +248,86 @@ class TestConfig:
         assert cfg["apiKey"] == "env-key"
         assert cfg["banks"]["hermes"]["bankId"] == "env-bank"
         assert cfg["banks"]["hermes"]["budget"] == "high"
+
+
+class TestPostSetup:
+    def test_local_embedded_setup_materializes_profile_env(self, tmp_path, monkeypatch):
+        hermes_home = tmp_path / "hermes-home"
+        user_home = tmp_path / "user-home"
+        user_home.mkdir()
+        monkeypatch.setenv("HOME", str(user_home))
+
+        selections = iter([1, 0])  # local_embedded, openai
+        monkeypatch.setattr("hermes_cli.memory_setup._curses_select", lambda *args, **kwargs: next(selections))
+        monkeypatch.setattr("shutil.which", lambda name: None)
+        monkeypatch.setattr("builtins.input", lambda prompt="": "")
+        monkeypatch.setattr("sys.stdin.isatty", lambda: True)
+        monkeypatch.setattr("getpass.getpass", lambda prompt="": "sk-local-test")
+        saved_configs = []
+        monkeypatch.setattr("hermes_cli.config.save_config", lambda cfg: saved_configs.append(cfg.copy()))
+
+        provider = HindsightMemoryProvider()
+        provider.post_setup(str(hermes_home), {"memory": {}})
+
+        assert saved_configs[-1]["memory"]["provider"] == "hindsight"
+        assert (hermes_home / ".env").read_text() == "HINDSIGHT_LLM_API_KEY=sk-local-test\n"
+
+        profile_env = user_home / ".hindsight" / "profiles" / "hermes.env"
+        assert profile_env.exists()
+        assert profile_env.read_text() == (
+            "HINDSIGHT_API_LLM_PROVIDER=openai\n"
+            "HINDSIGHT_API_LLM_API_KEY=sk-local-test\n"
+            "HINDSIGHT_API_LLM_MODEL=gpt-4o-mini\n"
+            "HINDSIGHT_API_LOG_LEVEL=info\n"
+        )
+
+    def test_local_embedded_setup_respects_existing_profile_name(self, tmp_path, monkeypatch):
+        hermes_home = tmp_path / "hermes-home"
+        user_home = tmp_path / "user-home"
+        user_home.mkdir()
+        monkeypatch.setenv("HOME", str(user_home))
+
+        selections = iter([1, 0])  # local_embedded, openai
+        monkeypatch.setattr("hermes_cli.memory_setup._curses_select", lambda *args, **kwargs: next(selections))
+        monkeypatch.setattr("shutil.which", lambda name: None)
+        monkeypatch.setattr("builtins.input", lambda prompt="": "")
+        monkeypatch.setattr("sys.stdin.isatty", lambda: True)
+        monkeypatch.setattr("getpass.getpass", lambda prompt="": "sk-local-test")
+        monkeypatch.setattr("hermes_cli.config.save_config", lambda cfg: None)
+
+        provider = HindsightMemoryProvider()
+        provider.save_config({"profile": "coder"}, str(hermes_home))
+        provider.post_setup(str(hermes_home), {"memory": {}})
+
+        coder_env = user_home / ".hindsight" / "profiles" / "coder.env"
+        hermes_env = user_home / ".hindsight" / "profiles" / "hermes.env"
+        assert coder_env.exists()
+        assert not hermes_env.exists()
+
+    def test_local_embedded_setup_preserves_existing_key_when_input_left_blank(self, tmp_path, monkeypatch):
+        hermes_home = tmp_path / "hermes-home"
+        user_home = tmp_path / "user-home"
+        user_home.mkdir()
+        monkeypatch.setenv("HOME", str(user_home))
+
+        selections = iter([1, 0])  # local_embedded, openai
+        monkeypatch.setattr("hermes_cli.memory_setup._curses_select", lambda *args, **kwargs: next(selections))
+        monkeypatch.setattr("shutil.which", lambda name: None)
+        monkeypatch.setattr("builtins.input", lambda prompt="": "")
+        monkeypatch.setattr("sys.stdin.isatty", lambda: True)
+        monkeypatch.setattr("getpass.getpass", lambda prompt="": "")
+        monkeypatch.setattr("hermes_cli.config.save_config", lambda cfg: None)
+
+        env_path = hermes_home / ".env"
+        env_path.parent.mkdir(parents=True, exist_ok=True)
+        env_path.write_text("HINDSIGHT_LLM_API_KEY=existing-key\n")
+
+        provider = HindsightMemoryProvider()
+        provider.post_setup(str(hermes_home), {"memory": {}})
+
+        profile_env = user_home / ".hindsight" / "profiles" / "hermes.env"
+        assert profile_env.exists()
+        assert "HINDSIGHT_API_LLM_API_KEY=existing-key\n" in profile_env.read_text()
 
 
 # ---------------------------------------------------------------------------
@@ -531,6 +610,22 @@ class TestSyncTurn:
         if provider._sync_thread:
             provider._sync_thread.join(timeout=5.0)
 
+    def test_sync_turn_preserves_unicode(self, provider_with_config):
+        """Non-ASCII text (CJK, ZWJ emoji) must survive JSON round-trip intact."""
+        p = provider_with_config()
+        p._client = _make_mock_client()
+        p.sync_turn("안녕 こんにちは 你好", "👨‍👩‍👧‍👦 family")
+        p._sync_thread.join(timeout=5.0)
+        p._client.aretain_batch.assert_called_once()
+        item = p._client.aretain_batch.call_args.kwargs["items"][0]
+        # ensure_ascii=False means non-ASCII chars appear as-is in the raw JSON,
+        # not as \uXXXX escape sequences.
+        raw_json = item["content"]
+        assert "안녕" in raw_json
+        assert "こんにちは" in raw_json
+        assert "你好" in raw_json
+        assert "👨‍👩‍👧‍👦" in raw_json
+
 
 # ---------------------------------------------------------------------------
 # System prompt tests
@@ -610,5 +705,65 @@ class TestAvailability:
             lambda: tmp_path / "nonexistent",
         )
         monkeypatch.setenv("HINDSIGHT_MODE", "local")
+        monkeypatch.setattr(
+            "plugins.memory.hindsight.importlib.import_module",
+            lambda name: object(),
+        )
         p = HindsightMemoryProvider()
         assert p.is_available()
+
+    def test_available_with_snake_case_api_key_in_config(self, tmp_path, monkeypatch):
+        config_path = tmp_path / "hindsight" / "config.json"
+        config_path.parent.mkdir(parents=True, exist_ok=True)
+        config_path.write_text(json.dumps({
+            "mode": "cloud",
+            "api_key": "***",
+        }))
+        monkeypatch.setattr(
+            "plugins.memory.hindsight.get_hermes_home",
+            lambda: tmp_path,
+        )
+
+        p = HindsightMemoryProvider()
+
+        assert p.is_available()
+
+    def test_local_mode_unavailable_when_runtime_import_fails(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(
+            "plugins.memory.hindsight.get_hermes_home",
+            lambda: tmp_path / "nonexistent",
+        )
+        monkeypatch.setenv("HINDSIGHT_MODE", "local")
+
+        def _raise(_name):
+            raise RuntimeError(
+                "NumPy was built with baseline optimizations: (x86_64-v2)"
+            )
+
+        monkeypatch.setattr(
+            "plugins.memory.hindsight.importlib.import_module",
+            _raise,
+        )
+        p = HindsightMemoryProvider()
+        assert not p.is_available()
+
+    def test_initialize_disables_local_mode_when_runtime_import_fails(self, tmp_path, monkeypatch):
+        config = {"mode": "local_embedded"}
+        config_path = tmp_path / "hindsight" / "config.json"
+        config_path.parent.mkdir(parents=True, exist_ok=True)
+        config_path.write_text(json.dumps(config))
+        monkeypatch.setattr(
+            "plugins.memory.hindsight.get_hermes_home", lambda: tmp_path
+        )
+
+        def _raise(_name):
+            raise RuntimeError("x86_64-v2 unsupported")
+
+        monkeypatch.setattr(
+            "plugins.memory.hindsight.importlib.import_module",
+            _raise,
+        )
+
+        p = HindsightMemoryProvider()
+        p.initialize(session_id="test-session", hermes_home=str(tmp_path), platform="cli")
+        assert p._mode == "disabled"

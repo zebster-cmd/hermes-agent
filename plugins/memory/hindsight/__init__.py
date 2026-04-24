@@ -23,6 +23,7 @@ Or via $HERMES_HOME/hindsight/config.json (profile-scoped), falling back to
 from __future__ import annotations
 
 import asyncio
+import importlib
 import json
 import logging
 import os
@@ -51,6 +52,22 @@ _PROVIDER_DEFAULT_MODELS = {
     "lmstudio": "local-model",
     "openai_compatible": "your-model-name",
 }
+
+
+def _check_local_runtime() -> tuple[bool, str | None]:
+    """Return whether local embedded Hindsight imports cleanly.
+
+    On older CPUs, importing the local Hindsight stack can raise a runtime
+    error from NumPy before the daemon starts. Treat that as "unavailable"
+    so Hermes can degrade gracefully instead of repeatedly trying to start
+    a broken local memory backend.
+    """
+    try:
+        importlib.import_module("hindsight")
+        importlib.import_module("hindsight_embed.daemon_embed_manager")
+        return True, None
+    except Exception as exc:
+        return False, str(exc)
 
 
 # ---------------------------------------------------------------------------
@@ -232,6 +249,72 @@ def _utc_timestamp() -> str:
     return datetime.now(timezone.utc).isoformat(timespec="milliseconds").replace("+00:00", "Z")
 
 
+def _embedded_profile_name(config: dict[str, Any]) -> str:
+    """Return the Hindsight embedded profile name for this Hermes config."""
+    profile = config.get("profile", "hermes")
+    return str(profile or "hermes")
+
+
+def _load_simple_env(path) -> dict[str, str]:
+    """Parse a simple KEY=VALUE env file, ignoring comments and blank lines."""
+    if not path.exists():
+        return {}
+
+    values: dict[str, str] = {}
+    for line in path.read_text(encoding="utf-8").splitlines():
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        key, value = line.split("=", 1)
+        values[key.strip()] = value.strip()
+    return values
+
+
+def _build_embedded_profile_env(config: dict[str, Any], *, llm_api_key: str | None = None) -> dict[str, str]:
+    """Build the profile-scoped env file that standalone hindsight-embed consumes."""
+    current_key = llm_api_key
+    if current_key is None:
+        current_key = (
+            config.get("llmApiKey")
+            or config.get("llm_api_key")
+            or os.environ.get("HINDSIGHT_LLM_API_KEY", "")
+        )
+
+    current_provider = config.get("llm_provider", "")
+    current_model = config.get("llm_model", "")
+    current_base_url = config.get("llm_base_url") or os.environ.get("HINDSIGHT_API_LLM_BASE_URL", "")
+
+    # The embedded daemon expects OpenAI wire format for these providers.
+    daemon_provider = "openai" if current_provider in ("openai_compatible", "openrouter") else current_provider
+
+    env_values = {
+        "HINDSIGHT_API_LLM_PROVIDER": str(daemon_provider),
+        "HINDSIGHT_API_LLM_API_KEY": str(current_key or ""),
+        "HINDSIGHT_API_LLM_MODEL": str(current_model),
+        "HINDSIGHT_API_LOG_LEVEL": "info",
+    }
+    if current_base_url:
+        env_values["HINDSIGHT_API_LLM_BASE_URL"] = str(current_base_url)
+    return env_values
+
+
+def _embedded_profile_env_path(config: dict[str, Any]):
+    from pathlib import Path
+
+    return Path.home() / ".hindsight" / "profiles" / f"{_embedded_profile_name(config)}.env"
+
+
+def _materialize_embedded_profile_env(config: dict[str, Any], *, llm_api_key: str | None = None):
+    """Write the profile-scoped env file that standalone hindsight-embed uses."""
+    profile_env = _embedded_profile_env_path(config)
+    profile_env.parent.mkdir(parents=True, exist_ok=True)
+    env_values = _build_embedded_profile_env(config, llm_api_key=llm_api_key)
+    profile_env.write_text(
+        "".join(f"{key}={value}\n" for key, value in env_values.items()),
+        encoding="utf-8",
+    )
+    return profile_env
+
+
 # ---------------------------------------------------------------------------
 # MemoryProvider implementation
 # ---------------------------------------------------------------------------
@@ -301,21 +384,16 @@ class HindsightMemoryProvider(MemoryProvider):
         try:
             cfg = _load_config()
             mode = cfg.get("mode", "cloud")
-            if mode in ("local", "local_embedded", "local_external"):
-                try:
-                    __import__("hindsight")
-                except ImportError:
-                    logger.debug("Hindsight local mode unavailable: 'hindsight' package not installed")
-                    return False
+            if mode in ("local", "local_embedded"):
+                available, _ = _check_local_runtime()
+                return available
+            if mode == "local_external":
                 return True
-            # Cloud mode: check that hindsight_client is importable
-            try:
-                __import__("hindsight_client")
-            except ImportError:
-                logger.debug("Hindsight cloud mode unavailable: 'hindsight-client' package not installed. "
-                             "Install with: pip install 'hermes-agent[hindsight]'")
-                return False
-            has_key = bool(cfg.get("apiKey") or os.environ.get("HINDSIGHT_API_KEY", ""))
+            has_key = bool(
+                cfg.get("apiKey")
+                or cfg.get("api_key")
+                or os.environ.get("HINDSIGHT_API_KEY", "")
+            )
             has_url = bool(cfg.get("api_url") or os.environ.get("HINDSIGHT_API_URL", ""))
             return has_key or has_url
         except Exception:
@@ -374,7 +452,7 @@ class HindsightMemoryProvider(MemoryProvider):
         else:
             deps_to_install = [cloud_dep]
 
-        print(f"\n  Checking dependencies...")
+        print("\n  Checking dependencies...")
         uv_path = shutil.which("uv")
         if not uv_path:
             print("  ⚠ uv not found — install it: curl -LsSf https://astral.sh/uv/install.sh | sh")
@@ -385,14 +463,14 @@ class HindsightMemoryProvider(MemoryProvider):
                     [uv_path, "pip", "install", "--python", sys.executable, "--quiet", "--upgrade"] + deps_to_install,
                     check=True, timeout=120, capture_output=True,
                 )
-                print(f"  ✓ Dependencies up to date")
+                print("  ✓ Dependencies up to date")
             except Exception as e:
                 print(f"  ⚠ Install failed: {e}")
                 print(f"  Run manually: uv pip install --python {sys.executable} {' '.join(deps_to_install)}")
 
         # Step 3: Mode-specific config
         if mode == "cloud":
-            print(f"\n  Get your API key at https://ui.hindsight.vectorize.io\n")
+            print("\n  Get your API key at https://ui.hindsight.vectorize.io\n")
             existing_key = os.environ.get("HINDSIGHT_API_KEY", "")
             if existing_key:
                 masked = f"...{existing_key[-4:]}" if len(existing_key) > 4 else "set"
@@ -445,13 +523,14 @@ class HindsightMemoryProvider(MemoryProvider):
             sys.stdout.write("  LLM API key: ")
             sys.stdout.flush()
             llm_key = getpass.getpass(prompt="") if sys.stdin.isatty() else sys.stdin.readline().strip()
-            if llm_key:
-                env_writes["HINDSIGHT_LLM_API_KEY"] = llm_key
+            # Always write explicitly (including empty) so the provider sees ""
+            # rather than a missing variable.  The daemon reads from .env at
+            # startup and fails when HINDSIGHT_LLM_API_KEY is unset.
+            env_writes["HINDSIGHT_LLM_API_KEY"] = llm_key
 
         # Step 4: Save everything
         provider_config["bank_id"] = "hermes"
         provider_config["recall_budget"] = "mid"
-        bank_id = "hermes"
         config["memory"]["provider"] = "hindsight"
         save_config(config)
 
@@ -477,10 +556,32 @@ class HindsightMemoryProvider(MemoryProvider):
                     new_lines.append(f"{k}={v}")
             env_path.write_text("\n".join(new_lines) + "\n")
 
+        if mode == "local_embedded":
+            materialized_config = dict(provider_config)
+            config_path = Path(hermes_home) / "hindsight" / "config.json"
+            try:
+                materialized_config = json.loads(config_path.read_text(encoding="utf-8"))
+            except Exception:
+                pass
+
+            llm_api_key = env_writes.get("HINDSIGHT_LLM_API_KEY", "")
+            if not llm_api_key:
+                llm_api_key = _load_simple_env(Path(hermes_home) / ".env").get("HINDSIGHT_LLM_API_KEY", "")
+            if not llm_api_key:
+                llm_api_key = _load_simple_env(_embedded_profile_env_path(materialized_config)).get(
+                    "HINDSIGHT_API_LLM_API_KEY",
+                    "",
+                )
+
+            _materialize_embedded_profile_env(
+                materialized_config,
+                llm_api_key=llm_api_key or None,
+            )
+
         print(f"\n  ✓ Hindsight memory configured ({mode} mode)")
         if env_writes:
-            print(f"  API keys saved to .env")
-        print(f"\n  Start a new session to activate.\n")
+            print("  API keys saved to .env")
+        print("\n  Start a new session to activate.\n")
 
     def get_config_schema(self):
         return [
@@ -522,6 +623,12 @@ class HindsightMemoryProvider(MemoryProvider):
         """Return the cached Hindsight client (created once, reused)."""
         if self._client is None:
             if self._mode == "local_embedded":
+                available, reason = _check_local_runtime()
+                if not available:
+                    raise RuntimeError(
+                        "Hindsight local runtime is unavailable"
+                        + (f": {reason}" if reason else "")
+                    )
                 from hindsight import HindsightEmbedded
                 HindsightEmbedded.__del__ = lambda self: None
                 llm_provider = self._config.get("llm_provider", "")
@@ -559,7 +666,9 @@ class HindsightMemoryProvider(MemoryProvider):
             if Version(installed) < Version(_MIN_CLIENT_VERSION):
                 logger.warning("hindsight-client %s is outdated (need >=%s), attempting upgrade...",
                                installed, _MIN_CLIENT_VERSION)
-                import shutil, subprocess, sys
+                import shutil
+                import subprocess
+                import sys
                 uv_path = shutil.which("uv")
                 if uv_path:
                     try:
@@ -592,6 +701,15 @@ class HindsightMemoryProvider(MemoryProvider):
         # "local" is a legacy alias for "local_embedded"
         if self._mode == "local":
             self._mode = "local_embedded"
+        if self._mode == "local_embedded":
+            available, reason = _check_local_runtime()
+            if not available:
+                logger.warning(
+                    "Hindsight local mode disabled because its runtime could not be imported: %s",
+                    reason,
+                )
+                self._mode = "disabled"
+                return
         self._api_key = self._config.get("apiKey") or self._config.get("api_key") or os.environ.get("HINDSIGHT_API_KEY", "")
         default_url = _DEFAULT_LOCAL_URL if self._mode in ("local_embedded", "local_external") else _DEFAULT_API_URL
         self._api_url = self._config.get("api_url") or os.environ.get("HINDSIGHT_API_URL", default_url)
@@ -680,42 +798,13 @@ class HindsightMemoryProvider(MemoryProvider):
                     # Update the profile .env to match our current config so
                     # the daemon always starts with the right settings.
                     # If the config changed and the daemon is running, stop it.
-                    from pathlib import Path as _Path
-                    profile_env = _Path.home() / ".hindsight" / "profiles" / f"{profile}.env"
-                    current_key = self._config.get("llm_api_key") or os.environ.get("HINDSIGHT_LLM_API_KEY", "")
-                    current_provider = self._config.get("llm_provider", "")
-                    current_model = self._config.get("llm_model", "")
-                    current_base_url = self._config.get("llm_base_url") or os.environ.get("HINDSIGHT_API_LLM_BASE_URL", "")
-                    # Map openai_compatible/openrouter → openai for the daemon (OpenAI wire format)
-                    daemon_provider = "openai" if current_provider in ("openai_compatible", "openrouter") else current_provider
-
-                    # Read saved profile config
-                    saved = {}
-                    if profile_env.exists():
-                        for line in profile_env.read_text().splitlines():
-                            if "=" in line and not line.startswith("#"):
-                                k, v = line.split("=", 1)
-                                saved[k.strip()] = v.strip()
-
-                    config_changed = (
-                        saved.get("HINDSIGHT_API_LLM_PROVIDER") != daemon_provider or
-                        saved.get("HINDSIGHT_API_LLM_MODEL") != current_model or
-                        saved.get("HINDSIGHT_API_LLM_API_KEY") != current_key or
-                        saved.get("HINDSIGHT_API_LLM_BASE_URL", "") != current_base_url
-                    )
+                    profile_env = _embedded_profile_env_path(self._config)
+                    expected_env = _build_embedded_profile_env(self._config)
+                    saved = _load_simple_env(profile_env)
+                    config_changed = saved != expected_env
 
                     if config_changed:
-                        # Write updated profile .env
-                        profile_env.parent.mkdir(parents=True, exist_ok=True)
-                        env_lines = (
-                            f"HINDSIGHT_API_LLM_PROVIDER={daemon_provider}\n"
-                            f"HINDSIGHT_API_LLM_API_KEY={current_key}\n"
-                            f"HINDSIGHT_API_LLM_MODEL={current_model}\n"
-                            f"HINDSIGHT_API_LOG_LEVEL=info\n"
-                        )
-                        if current_base_url:
-                            env_lines += f"HINDSIGHT_API_LLM_BASE_URL={current_base_url}\n"
-                        profile_env.write_text(env_lines)
+                        profile_env = _materialize_embedded_profile_env(self._config)
                         if client._manager.is_running(profile):
                             with open(log_path, "a") as f:
                                 f.write("\n=== Config changed, restarting daemon ===\n")
@@ -899,7 +988,7 @@ class HindsightMemoryProvider(MemoryProvider):
         if session_id:
             self._session_id = str(session_id).strip()
 
-        turn = json.dumps(self._build_turn_messages(user_content, assistant_content))
+        turn = json.dumps(self._build_turn_messages(user_content, assistant_content), ensure_ascii=False)
         self._session_turns.append(turn)
         self._turn_counter += 1
         self._turn_index = self._turn_counter
