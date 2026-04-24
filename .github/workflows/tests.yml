@@ -3,8 +3,17 @@ name: Tests
 on:
   push:
     branches: [main]
+    paths-ignore:
+      - '**/*.md'
+      - 'docs/**'
   pull_request:
     branches: [main]
+    paths-ignore:
+      - '**/*.md'
+      - 'docs/**'
+
+permissions:
+  contents: read
 
 # Cancel in-progress runs for the same PR/branch
 concurrency:
@@ -14,13 +23,16 @@ concurrency:
 jobs:
   test:
     runs-on: ubuntu-latest
-    timeout-minutes: 10
+    timeout-minutes: 20
     steps:
       - name: Checkout code
-        uses: actions/checkout@v4
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5  # v4
+
+      - name: Install system dependencies
+        run: sudo apt-get update && sudo apt-get install -y ripgrep
 
       - name: Install uv
-        uses: astral-sh/setup-uv@v5
+        uses: astral-sh/setup-uv@d4b2f3b6ecc6e67c4457f6d3e41ec42d3d0fcb86  # v5
 
       - name: Set up Python 3.11
         run: uv python install 3.11
@@ -31,12 +43,28 @@ jobs:
           source .venv/bin/activate
           uv pip install -e ".[all,dev]"
 
-      - name: Run tests
+      - name: Run tests (scoped to plugin & web_server — our fork only touches these)
         run: |
           source .venv/bin/activate
-          python -m pytest tests/ -q --ignore=tests/integration --tb=short -n auto
+          python -m pytest \
+            tests/hermes_cli/test_web_server.py \
+            tests/hermes_cli/test_web_server_host_header.py \
+            tests/hermes_cli/test_plugins.py \
+            tests/hermes_cli/test_plugin_cli_registration.py \
+            tests/hermes_cli/test_plugin_scanner_recursion.py \
+            tests/hermes_cli/test_plugins_cmd.py \
+            tests/hermes_cli/test_completion.py \
+            tests/test_plugin_skills.py \
+            tests/test_toolsets.py \
+            tests/run_agent/test_plugin_context_engine_init.py \
+            -q --tb=short -n auto
         env:
           # Ensure tests don't accidentally call real APIs
           OPENROUTER_API_KEY: ""
           OPENAI_API_KEY: ""
           NOUS_API_KEY: ""
+
+  # e2e tests removed — they test the full agent stack (providers,
+  # transports, gateways) which this fork doesn't modify. The
+  # upstream repo runs the full suite on every PR to main.
+

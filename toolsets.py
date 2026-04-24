@@ -37,15 +37,13 @@ _HERMES_CORE_TOOLS = [
     "read_file", "write_file", "patch", "search_files",
     # Vision + image generation
     "vision_analyze", "image_generate",
-    # MoA
-    "mixture_of_agents",
     # Skills
     "skills_list", "skill_view", "skill_manage",
     # Browser automation
     "browser_navigate", "browser_snapshot", "browser_click",
     "browser_type", "browser_scroll", "browser_back",
-    "browser_press", "browser_close", "browser_get_images",
-    "browser_vision", "browser_console",
+    "browser_press", "browser_get_images",
+    "browser_vision", "browser_console", "browser_cdp",
     # Text-to-speech
     "text_to_speech",
     # Planning & memory
@@ -60,8 +58,6 @@ _HERMES_CORE_TOOLS = [
     "cronjob",
     # Cross-platform messaging (gated on gateway running via check_fn)
     "send_message",
-    # Honcho memory tools (gated on honcho being active via check_fn)
-    "honcho_context", "honcho_profile", "honcho_search", "honcho_conclude",
     # Home Assistant smart home control (gated on HASS_TOKEN via check_fn)
     "ha_list_entities", "ha_get_state", "ha_list_services", "ha_call_service",
 ]
@@ -118,8 +114,8 @@ TOOLSETS = {
         "tools": [
             "browser_navigate", "browser_snapshot", "browser_click",
             "browser_type", "browser_scroll", "browser_back",
-            "browser_press", "browser_close", "browser_get_images",
-            "browser_vision", "browser_console", "web_search"
+            "browser_press", "browser_get_images",
+            "browser_vision", "browser_console", "browser_cdp", "web_search"
         ],
         "includes": []
     },
@@ -155,7 +151,7 @@ TOOLSETS = {
     },
     
     "tts": {
-        "description": "Text-to-speech: convert text to audio with Edge TTS (free), ElevenLabs, or OpenAI",
+        "description": "Text-to-speech: convert text to audio with Edge TTS (free), ElevenLabs, OpenAI, or xAI",
         "tools": ["text_to_speech"],
         "includes": []
     },
@@ -196,15 +192,27 @@ TOOLSETS = {
         "includes": []
     },
 
-    "honcho": {
-        "description": "Honcho AI-native memory for persistent cross-session user modeling",
-        "tools": ["honcho_context", "honcho_profile", "honcho_search", "honcho_conclude"],
-        "includes": []
-    },
+    # "honcho" toolset removed — Honcho is now a memory provider plugin.
+    # Tools are injected via MemoryManager, not the toolset system.
 
     "homeassistant": {
         "description": "Home Assistant smart home control and monitoring",
         "tools": ["ha_list_entities", "ha_get_state", "ha_list_services", "ha_call_service"],
+        "includes": []
+    },
+
+    "feishu_doc": {
+        "description": "Read Feishu/Lark document content",
+        "tools": ["feishu_doc_read"],
+        "includes": []
+    },
+
+    "feishu_drive": {
+        "description": "Feishu/Lark document comment operations (list, reply, add)",
+        "tools": [
+            "feishu_drive_list_comments", "feishu_drive_list_comment_replies",
+            "feishu_drive_reply_comment", "feishu_drive_add_comment",
+        ],
         "includes": []
     },
 
@@ -219,7 +227,7 @@ TOOLSETS = {
     
     "safe": {
         "description": "Safe toolkit without terminal access",
-        "tools": ["mixture_of_agents"],
+        "tools": [],
         "includes": ["web", "vision", "image_gen"]
     },
     
@@ -240,8 +248,8 @@ TOOLSETS = {
             "skills_list", "skill_view", "skill_manage",
             "browser_navigate", "browser_snapshot", "browser_click",
             "browser_type", "browser_scroll", "browser_back",
-            "browser_press", "browser_close", "browser_get_images",
-            "browser_vision", "browser_console",
+            "browser_press", "browser_get_images",
+            "browser_vision", "browser_console", "browser_cdp",
             "todo", "memory",
             "session_search",
             "execute_code", "delegate_task",
@@ -260,15 +268,13 @@ TOOLSETS = {
             "read_file", "write_file", "patch", "search_files",
             # Vision + image generation
             "vision_analyze", "image_generate",
-            # MoA
-            "mixture_of_agents",
             # Skills
             "skills_list", "skill_view", "skill_manage",
             # Browser automation
             "browser_navigate", "browser_snapshot", "browser_click",
             "browser_type", "browser_scroll", "browser_back",
-            "browser_press", "browser_close", "browser_get_images",
-            "browser_vision", "browser_console",
+            "browser_press", "browser_get_images",
+            "browser_vision", "browser_console", "browser_cdp",
             # Planning & memory
             "todo", "memory",
             # Session history search
@@ -279,8 +285,7 @@ TOOLSETS = {
             "cronjob",
             # Home Assistant smart home control (gated on HASS_TOKEN via check_fn)
             "ha_list_entities", "ha_get_state", "ha_list_services", "ha_call_service",
-            # Honcho memory tools (gated on honcho being active via check_fn)
-            "honcho_context", "honcho_profile", "honcho_search", "honcho_conclude",
+
         ],
         "includes": []
     },
@@ -299,7 +304,10 @@ TOOLSETS = {
     
     "hermes-discord": {
         "description": "Discord bot toolset - full access (terminal has safety checks via dangerous command approval)",
-        "tools": _HERMES_CORE_TOOLS,
+        "tools": _HERMES_CORE_TOOLS + [
+            # Discord server introspection & management (gated on DISCORD_BOT_TOKEN via check_fn)
+            "discord_server",
+        ],
         "includes": []
     },
     
@@ -317,6 +325,12 @@ TOOLSETS = {
     
     "hermes-signal": {
         "description": "Signal bot toolset - encrypted messaging platform (full access)",
+        "tools": _HERMES_CORE_TOOLS,
+        "includes": []
+    },
+
+    "hermes-bluebubbles": {
+        "description": "BlueBubbles iMessage bot toolset - Apple iMessage via local BlueBubbles server",
         "tools": _HERMES_CORE_TOOLS,
         "includes": []
     },
@@ -357,8 +371,26 @@ TOOLSETS = {
         "includes": []
     },
 
+    "hermes-weixin": {
+        "description": "Weixin bot toolset - personal WeChat messaging via iLink (full access)",
+        "tools": _HERMES_CORE_TOOLS,
+        "includes": []
+    },
+
+    "hermes-qqbot": {
+        "description": "QQBot toolset - QQ messaging via Official Bot API v2 (full access)",
+        "tools": _HERMES_CORE_TOOLS,
+        "includes": []
+    },
+
     "hermes-wecom": {
         "description": "WeCom bot toolset - enterprise WeChat messaging (full access)",
+        "tools": _HERMES_CORE_TOOLS,
+        "includes": []
+    },
+
+    "hermes-wecom-callback": {
+        "description": "WeCom callback toolset - enterprise self-built app messaging (full access)",
         "tools": _HERMES_CORE_TOOLS,
         "includes": []
     },
@@ -369,10 +401,16 @@ TOOLSETS = {
         "includes": []
     },
 
+    "hermes-webhook": {
+        "description": "Webhook toolset - receive and process external webhook events",
+        "tools": _HERMES_CORE_TOOLS,
+        "includes": []
+    },
+
     "hermes-gateway": {
         "description": "Gateway toolset - union of all messaging platform tools",
         "tools": [],
-        "includes": ["hermes-telegram", "hermes-discord", "hermes-whatsapp", "hermes-slack", "hermes-signal", "hermes-homeassistant", "hermes-email", "hermes-sms", "hermes-mattermost", "hermes-matrix", "hermes-dingtalk", "hermes-feishu", "hermes-wecom"]
+        "includes": ["hermes-telegram", "hermes-discord", "hermes-whatsapp", "hermes-slack", "hermes-signal", "hermes-bluebubbles", "hermes-homeassistant", "hermes-email", "hermes-sms", "hermes-mattermost", "hermes-matrix", "hermes-dingtalk", "hermes-feishu", "hermes-wecom", "hermes-wecom-callback", "hermes-weixin", "hermes-qqbot", "hermes-webhook"]
     }
 }
 
@@ -389,8 +427,39 @@ def get_toolset(name: str) -> Optional[Dict[str, Any]]:
         Dict: Toolset definition with description, tools, and includes
         None: If toolset not found
     """
-    # Return toolset definition
-    return TOOLSETS.get(name)
+    toolset = TOOLSETS.get(name)
+    if toolset:
+        return toolset
+
+    try:
+        from tools.registry import registry
+    except Exception:
+        return None
+
+    registry_toolset = name
+    description = f"Plugin toolset: {name}"
+    alias_target = registry.get_toolset_alias_target(name)
+
+    if name not in _get_plugin_toolset_names():
+        registry_toolset = alias_target
+        if not registry_toolset:
+            return None
+        description = f"MCP server '{name}' tools"
+    else:
+        reverse_aliases = {
+            canonical: alias
+            for alias, canonical in _get_registry_toolset_aliases().items()
+            if alias not in TOOLSETS
+        }
+        alias = reverse_aliases.get(name)
+        if alias:
+            description = f"MCP server '{alias}' tools"
+
+    return {
+        "description": description,
+        "tools": registry.get_tool_names_for_toolset(registry_toolset),
+        "includes": [],
+    }
 
 
 def resolve_toolset(name: str, visited: Set[str] = None) -> List[str]:
@@ -418,7 +487,7 @@ def resolve_toolset(name: str, visited: Set[str] = None) -> List[str]:
             # Use a fresh visited set per branch to avoid cross-branch contamination
             resolved = resolve_toolset(toolset_name, visited.copy())
             all_tools.update(resolved)
-        return list(all_tools)
+        return sorted(all_tools)
 
     # Check for cycles / already-resolved (diamond deps).
     # Silently return [] — either this is a diamond (not a bug, tools already
@@ -429,15 +498,8 @@ def resolve_toolset(name: str, visited: Set[str] = None) -> List[str]:
     visited.add(name)
 
     # Get toolset definition
-    toolset = TOOLSETS.get(name)
+    toolset = get_toolset(name)
     if not toolset:
-        # Fall back to tool registry for plugin-provided toolsets
-        if name in _get_plugin_toolset_names():
-            try:
-                from tools.registry import registry
-                return [e.name for e in registry._tools.values() if e.toolset == name]
-            except Exception:
-                pass
         return []
 
     # Collect direct tools
@@ -450,7 +512,7 @@ def resolve_toolset(name: str, visited: Set[str] = None) -> List[str]:
         included_tools = resolve_toolset(included_name, visited)
         tools.update(included_tools)
     
-    return list(tools)
+    return sorted(tools)
 
 
 def resolve_multiple_toolsets(toolset_names: List[str]) -> List[str]:
@@ -469,7 +531,7 @@ def resolve_multiple_toolsets(toolset_names: List[str]) -> List[str]:
         tools = resolve_toolset(name)
         all_tools.update(tools)
     
-    return list(all_tools)
+    return sorted(all_tools)
 
 
 def _get_plugin_toolset_names() -> Set[str]:
@@ -481,12 +543,21 @@ def _get_plugin_toolset_names() -> Set[str]:
     try:
         from tools.registry import registry
         return {
-            entry.toolset
-            for entry in registry._tools.values()
-            if entry.toolset not in TOOLSETS
+            toolset_name
+            for toolset_name in registry.get_registered_toolset_names()
+            if toolset_name not in TOOLSETS
         }
     except Exception:
         return set()
+
+
+def _get_registry_toolset_aliases() -> Dict[str, str]:
+    """Return explicit toolset aliases registered in the live registry."""
+    try:
+        from tools.registry import registry
+        return registry.get_registered_toolset_aliases()
+    except Exception:
+        return {}
 
 
 def get_all_toolsets() -> Dict[str, Dict[str, Any]]:
@@ -498,19 +569,19 @@ def get_all_toolsets() -> Dict[str, Dict[str, Any]]:
     Returns:
         Dict: All toolset definitions
     """
-    result = TOOLSETS.copy()
-    # Add plugin-provided toolsets (synthetic entries)
+    result = dict(TOOLSETS)
+    aliases = _get_registry_toolset_aliases()
     for ts_name in _get_plugin_toolset_names():
-        if ts_name not in result:
-            try:
-                from tools.registry import registry
-                tools = [e.name for e in registry._tools.values() if e.toolset == ts_name]
-                result[ts_name] = {
-                    "description": f"Plugin toolset: {ts_name}",
-                    "tools": tools,
-                }
-            except Exception:
-                pass
+        display_name = ts_name
+        for alias, canonical in aliases.items():
+            if canonical == ts_name and alias not in TOOLSETS:
+                display_name = alias
+                break
+        if display_name in result:
+            continue
+        toolset = get_toolset(display_name)
+        if toolset:
+            result[display_name] = toolset
     return result
 
 
@@ -524,7 +595,14 @@ def get_toolset_names() -> List[str]:
         List[str]: List of toolset names
     """
     names = set(TOOLSETS.keys())
-    names |= _get_plugin_toolset_names()
+    aliases = _get_registry_toolset_aliases()
+    for ts_name in _get_plugin_toolset_names():
+        for alias, canonical in aliases.items():
+            if canonical == ts_name and alias not in TOOLSETS:
+                names.add(alias)
+                break
+        else:
+            names.add(ts_name)
     return sorted(names)
 
 
@@ -545,8 +623,9 @@ def validate_toolset(name: str) -> bool:
         return True
     if name in TOOLSETS:
         return True
-    # Check tool registry for plugin-provided toolsets
-    return name in _get_plugin_toolset_names()
+    if name in _get_plugin_toolset_names():
+        return True
+    return name in _get_registry_toolset_aliases()
 
 
 def create_custom_toolset(
@@ -596,7 +675,7 @@ def get_toolset_info(name: str) -> Dict[str, Any]:
         "includes": toolset["includes"],
         "resolved_tools": resolved_tools,
         "tool_count": len(resolved_tools),
-        "is_composite": len(toolset["includes"]) > 0
+        "is_composite": bool(toolset["includes"])
     }
 
 
