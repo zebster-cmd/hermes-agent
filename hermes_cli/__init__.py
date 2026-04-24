@@ -5,16 +5,11 @@ Provides subcommands for:
 - hermes chat          - Interactive chat (same as ./hermes)
 - hermes gateway       - Run gateway in foreground
 - hermes gateway start - Start gateway service
-- hermes gateway stop  - Stop gateway service  
+- hermes gateway stop  - Stop gateway service
 - hermes setup         - Interactive setup wizard
 - hermes status        - Show status of all components
 - hermes cron          - Manage cron jobs
 """
 
-<<<<<<< HEAD
-__version__ = "0.9.0"
-__release_date__ = "2026.4.13"
-=======
-__version__ = "0.10.0"
-__release_date__ = "2026.4.16"
->>>>>>> origin/live
+__version__ = "0.11.0"
+__release_date__ = "2026.4.23"
