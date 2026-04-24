@@ -11,6 +11,7 @@ Usage:
 
 import asyncio
 import hmac
+import importlib.machinery
 import importlib.util
 import json
 import logging
@@ -2489,23 +2490,64 @@ def _mount_plugin_api_routes():
     Each plugin's ``api`` field points to a Python file that must expose
     a ``router`` (FastAPI APIRouter).  Routes are mounted under
     ``/api/plugins/<name>/``.
+
+    The plugin directory is treated as a Python package so that relative
+    imports within the plugin (e.g. ``from .helpers import foo``) work
+    correctly.  If an ``__init__.py`` exists in the plugin directory it
+    is loaded as the package init; otherwise a synthetic (empty) package
+    is registered.
     """
     for plugin in _get_dashboard_plugins():
         api_file_name = plugin.get("_api_file")
         if not api_file_name:
             continue
-        api_path = Path(plugin["_dir"]) / api_file_name
+        plugin_dir = Path(plugin["_dir"])
+        api_path = plugin_dir / api_file_name
         if not api_path.exists():
             _log.warning("Plugin %s declares api=%s but file not found", plugin["name"], api_file_name)
             continue
         try:
-            spec = importlib.util.spec_from_file_location(
-                f"hermes_dashboard_plugin_{plugin['name']}", api_path,
-            )
+            # Sanitise plugin name for use as a Python identifier.
+            pkg_name = f"hermes_dashboard_plugin_{plugin['name'].replace('-', '_')}"
+            plugin_dir_str = str(plugin_dir)
+
+            # ── register the plugin directory as a package ──────────
+            init_path = plugin_dir / "__init__.py"
+            if init_path.exists():
+                pkg_spec = importlib.util.spec_from_file_location(
+                    pkg_name,
+                    str(init_path),
+                    submodule_search_locations=[plugin_dir_str],
+                )
+                if pkg_spec and pkg_spec.loader:
+                    pkg_mod = importlib.util.module_from_spec(pkg_spec)
+                    sys.modules[pkg_name] = pkg_mod
+                    pkg_spec.loader.exec_module(pkg_mod)
+            else:
+                # No __init__.py — create a synthetic namespace package
+                # so that relative imports still resolve.
+                pkg_spec = importlib.machinery.ModuleSpec(
+                    pkg_name,
+                    None,
+                    is_package=True,
+                )
+                pkg_spec.submodule_search_locations = [plugin_dir_str]
+                pkg_mod = importlib.util.module_from_spec(pkg_spec)
+                pkg_mod.__path__ = [plugin_dir_str]
+                sys.modules[pkg_name] = pkg_mod
+
+            # ── load the API module as a sub-module of the package ──
+            mod_name = api_file_name.removesuffix(".py")
+            fqn = f"{pkg_name}.{mod_name}"
+
+            spec = importlib.util.spec_from_file_location(fqn, str(api_path))
             if spec is None or spec.loader is None:
                 continue
             mod = importlib.util.module_from_spec(spec)
+            mod.__package__ = pkg_name
+            sys.modules[fqn] = mod
             spec.loader.exec_module(mod)
+
             router = getattr(mod, "router", None)
             if router is None:
                 _log.warning("Plugin %s api file has no 'router' attribute", plugin["name"])
